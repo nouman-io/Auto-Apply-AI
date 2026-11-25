@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
+import { API_BASE } from '@/app/lib/api';
 
 interface User {
   id: string;
@@ -16,8 +17,6 @@ interface AuthContextType {
   login: (token: string, user: User) => void;
   logout: () => void;
 }
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
@@ -39,33 +38,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       try {
         const response = await fetch(`${API_BASE}/api/v1/users/me`, {
-          headers: {
-            'Authorization': `Bearer ${storedToken}`
-          }
+          headers: { Authorization: `Bearer ${storedToken}` },
         });
 
         if (response.ok) {
           const userData = await response.json();
           setToken(storedToken);
-          setUser({
-            id: userData.id,
-            email: userData.email
-          });
+          setUser({ id: userData.id, email: userData.email });
         } else {
-          // Token expired or invalid
           localStorage.removeItem('auth_token');
           localStorage.removeItem('auth_user');
           setToken(null);
           setUser(null);
         }
       } catch (err) {
-        // If backend is down or unreachable during local offline dev, fallback to stored user session if present
         console.warn('Backend unreachable during token verification. Falling back to stored session.', err);
         if (storedUser) {
           try {
             setToken(storedToken);
             setUser(JSON.parse(storedUser));
-          } catch (e) {
+          } catch {
             localStorage.removeItem('auth_token');
             localStorage.removeItem('auth_user');
           }

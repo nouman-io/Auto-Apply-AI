@@ -3,8 +3,7 @@
 import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/app/context/AuthContext';
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+import { API_BASE, parseApiError } from '@/app/lib/api';
 
 export default function Login() {
   const [email, setEmail] = useState('');
@@ -22,21 +21,18 @@ export default function Login() {
     try {
       const response = await fetch(`${API_BASE}/api/v1/auth/login`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Incorrect email or password');
+        throw new Error(await parseApiError(response, 'Incorrect email or password'));
       }
 
       const data = await response.json();
       login(data.access_token, data.user);
-    } catch (err: any) {
-      setError(err.message || 'Login failed. Please try again.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Login failed. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -104,7 +100,7 @@ export default function Login() {
           </form>
 
           <div className="mt-6 pt-4 border-t border-white/10 text-xs text-slate-400">
-            Don't have an account?{' '}
+            Don&apos;t have an account?{' '}
             <button
               onClick={() => router.push('/auth/register')}
               className="font-bold text-rose-400 hover:text-rose-300 transition-colors"

@@ -2,85 +2,33 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
+import { API_BASE, parseApiError } from "../lib/api";
+import { DAILY_APPLY_MAX } from "../constants";
 import Navbar from "../components/Navbar";
 import JobsTab from "../components/JobsTab";
 import ErrorBoundary from "../components/ErrorBoundary";
 import Toast from "../components/Toast";
-import { Job, Application } from "../types";
-import { ALL_WORLD_COUNTRIES } from "../constants";
+import { Job } from "../types";
 import EmailReviewModal from "../components/EmailReviewModal";
 import AutoApplyModal from "../components/AutoApplyModal";
 import AutoApplyProgress from "../components/AutoApplyProgress";
 import JobDetailsModal from "../components/JobDetailsModal";
 
-// Map country names (with emoji flags) to standardized names without emoji for matching
-const COUNTRY_NAME_MAP: Record<string, string> = {
-  "United States": "us",
-  "Canada": "ca",
-  "United Kingdom": "gb",
-  "Germany": "de",
-  "Netherlands": "nl",
-  "Switzerland": "ch",
-  "Sweden": "se",
-  "Australia": "au",
-  "Singapore": "sg",
-  "United Arab Emirates": "ae",
-  "Saudi Arabia": "sa",
-  "Japan": "jp",
-  "Ireland": "ie",
-  "France": "fr",
-  "New Zealand": "nz",
-  "Denmark": "dk",
-  "Norway": "no",
-  "Finland": "fi",
-  "Austria": "at",
-  "Belgium": "be",
-  "Spain": "es",
-  "Italy": "it",
-  "Portugal": "pt",
-  "Poland": "pl",
-  "Estonia": "ee",
-  "Qatar": "qa",
-  "Kuwait": "kw",
-  "Oman": "om",
-  "Bahrain": "bh",
-  "Turkey": "tr",
-  "South Korea": "kr",
-  "Malaysia": "my",
-  "China": "cn",
-  "India": "in",
-  "Pakistan": "pk",
-  "Brazil": "br",
-  "Mexico": "mx",
-  "Argentina": "ar",
-  "Chile": "cl",
-  "South Africa": "za"
-};
-
-function normalizeCountryName(country: string): string {
-  // Strip emoji flags and trim
-  return country.replace(/[\u{1F1E6}-\u{1F1FF}]/gu, "").trim();
-}
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-
 export default function OpportunitiesPage() {
   const { token, isAuthenticated } = useAuth();
 
-  // Data & UI State
   const [dailyJobs, setDailyJobs] = useState<Job[]>([]);
-  const [selectedCountries, setSelectedCountries] = useState<string[]>([
-    "United States", "United Kingdom", "Canada", "Australia",
-    "Germany", "France", "Singapore", "Netherlands",
-    "Sweden", "Switzerland", "United Arab Emirates"
-  ]);
+  const [selectedSource, setSelectedSource] = useState<string>("All");
+  const [sourceStats, setSourceStats] = useState<Record<string, any> | null>(null);
+  const [todayApplied, setTodayApplied] = useState(0);
+  const [dailyMax, setDailyMax] = useState(DAILY_APPLY_MAX);
+
   const [isJobsLoading, setIsJobsLoading] = useState(true);
   const [jobsError, setJobsError] = useState<string | null>(null);
-
   const [isTriggeringSearch, setIsTriggeringSearch] = useState(false);
   const [isApplyingId, setIsApplyingId] = useState<number | null>(null);
 
-  // Email Review Modal State
+  // Email Review Modal State (when HR email is found)
   const [isReviewModalOpen, setIsReviewModalOpen] = useState(false);
   const [emailPreview, setEmailPreview] = useState<any>(null);
   const [isSendingEmail, setIsSendingEmail] = useState(false);
@@ -91,37 +39,34 @@ export default function OpportunitiesPage() {
   const [isJobDetailsOpen, setIsJobDetailsOpen] = useState(false);
   const [isApplyingFromDetails, setIsApplyingFromDetails] = useState(false);
 
-  // Auto-Apply Batch State
+  // Auto-Apply Batch State (0 -> 15 daily max)
   const [isAutoApplyModalOpen, setIsAutoApplyModalOpen] = useState(false);
   const [isStartingAutoApply, setIsStartingAutoApply] = useState(false);
   const [autoApplyStatus, setAutoApplyStatus] = useState<any>(null);
   const [isStoppingAutoApply, setIsStoppingAutoApply] = useState(false);
   const [isDismissingAutoApply, setIsDismissingAutoApply] = useState(false);
 
-  // Toast Notification State
   const [notification, setNotification] = useState<{ message: string; type: "success" | "error" } | null>(null);
-
   const showToast = (message: string, type: "success" | "error" = "success") => {
     setNotification({ message, type });
     setTimeout(() => {
       setNotification((prev) => (prev?.message === message ? null : prev));
-    }, 4000);
+    }, 4500);
   };
 
-  const fetchUserSettings = useCallback(async () => {
+  const fetchQuota = useCallback(async () => {
     if (!token) return;
     try {
-      const res = await fetch(`${API_BASE}/api/v1/users/settings`, {
-        headers: { "Authorization": `Bearer ${token}` }
+      const res = await fetch(`${API_BASE}/api/v1/auto-apply/quota`, {
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
         const data = await res.json();
-        if (data.target_countries?.length) {
-          setSelectedCountries(data.target_countries);
-        }
+        setTodayApplied(data.today_applied || 0);
+        setDailyMax(data.daily_max || DAILY_APPLY_MAX);
       }
     } catch (err) {
-      console.error("Failed to load target countries setting:", err);
+      console.error("Failed to fetch daily quota:", err);
     }
   }, [token]);
 
@@ -130,33 +75,57 @@ export default function OpportunitiesPage() {
     setIsJobsLoading(true);
     setJobsError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/search/opportunities?limit=50`, {
-        headers: { "Authorization": `Bearer ${token}` }
+      const res = await fetch(`${API_BASE}/api/v1/search/opportunities?limit=100`, {
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
-        if (res.status === 404) {
-          setDailyJobs([]);
-          return;
-        }
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || `Server responded with status ${res.status}`);
+        throw new Error(await parseApiError(res, "Failed to load opportunities"));
       }
       const data = await res.json();
       setDailyJobs(data.items || []);
-    } catch (err: any) {
+    } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to load job opportunities";
       setJobsError(msg);
-      showToast(`Opportunities fetch failed: ${msg}`, "error");
+      showToast(msg, "error");
     } finally {
       setIsJobsLoading(false);
     }
   }, [token]);
 
+  const fetchAutoApplyStatus = useCallback(async () => {
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/auto-apply/status`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAutoApplyStatus(data);
+        if (data.status === "completed" || data.status === "stopped") {
+          fetchQuota();
+          fetchOpportunities();
+        }
+      }
+    } catch (err) {
+      console.error("Failed to fetch auto-apply status:", err);
+    }
+  }, [token, fetchQuota, fetchOpportunities]);
+
   useEffect(() => {
     if (!isAuthenticated || !token) return;
-    fetchUserSettings();
+    fetchQuota();
     fetchOpportunities();
-  }, [isAuthenticated, token, fetchUserSettings, fetchOpportunities]);
+    fetchAutoApplyStatus();
+  }, [isAuthenticated, token, fetchQuota, fetchOpportunities, fetchAutoApplyStatus]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !token) return;
+    if (autoApplyStatus?.status !== "running") return;
+    const interval = setInterval(() => {
+      fetchAutoApplyStatus();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [isAuthenticated, token, autoApplyStatus?.status, fetchAutoApplyStatus]);
 
   const handleTriggerSearchAgent = async () => {
     setIsTriggeringSearch(true);
@@ -165,104 +134,108 @@ export default function OpportunitiesPage() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({})
+        body: JSON.stringify({}),
       });
       if (res.ok) {
         const data = await res.json();
-        showToast(data.message || "Smart Job Search Agent completed multi-country scan!");
+        setSourceStats(data.source_status || null);
+        showToast(data.message || "Job scan completed!");
         fetchOpportunities();
       } else {
-        if (res.status === 429) {
-          showToast("Your API key limit has been reached! Please enter a new API key in Settings.", "error");
-        } else {
-          const errData = await res.json().catch(() => ({}));
-          showToast(errData.detail || `Failed to trigger Smart Search Agent (status ${res.status}).`, "error");
-        }
+        showToast(await parseApiError(res, "Job search failed"), "error");
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to trigger Smart Search Agent.", "error");
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Job search failed.", "error");
     } finally {
       setIsTriggeringSearch(false);
     }
   };
 
-  // Step 1: Generate preview and show review modal
+  // Single job apply: Email preview if HR email found & Gmail connected, else Playwright directly
   const handleAutoApply = async (job: Job) => {
     setIsApplyingId(job.id);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auto-apply/preview`, {
+      if (job.company_email) {
+        const previewRes = await fetch(`${API_BASE}/api/v1/auto-apply/preview`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ job_id: job.id }),
+        });
+        if (previewRes.ok) {
+          const data = await previewRes.json();
+          if (data.success && data.preview?.apply_method === "email") {
+            setPendingJob(job);
+            setEmailPreview(data.preview);
+            setIsReviewModalOpen(true);
+            setIsJobDetailsOpen(false);
+            return;
+          }
+        }
+      }
+
+      // Web-based (or Gmail not connected): execute Playwright route immediately
+      const res = await fetch(`${API_BASE}/api/v1/auto-apply/apply-one`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ job_id: job.id })
+        body: JSON.stringify({ job_id: job.id }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.preview) {
-          setPendingJob(job);
-          setEmailPreview(data.preview);
-          setIsReviewModalOpen(true);
-          // Close job details modal if open
-          setIsJobDetailsOpen(false);
-        } else {
-          showToast(data.message || "Failed to generate email preview.", "error");
-        }
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showToast(data.message || `Applied to ${job.company}!`);
+        setIsJobDetailsOpen(false);
+        fetchQuota();
+        fetchOpportunities();
       } else {
-        const errData = await res.json().catch(() => ({}));
-        showToast(errData.detail || `Failed to generate email preview (status ${res.status}).`, "error");
+        showToast(data.detail || data.error || data.message || "Application did not complete.", "error");
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to connect to backend application router.", "error");
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Apply request failed.", "error");
     } finally {
       setIsApplyingId(null);
       setIsApplyingFromDetails(false);
     }
   };
 
-  // Handle apply from job details modal
   const handleApplyFromDetails = async (job: Job) => {
     setIsApplyingFromDetails(true);
     await handleAutoApply(job);
   };
 
-  // Open job details modal
   const handleViewJobDetails = (job: Job) => {
     setSelectedJob(job);
     setIsJobDetailsOpen(true);
   };
 
-  // Step 2: User confirmed - send the email
   const handleConfirmSendEmail = async () => {
     if (!pendingJob) return;
     setIsSendingEmail(true);
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auto-apply/send-email`, {
+      const res = await fetch(`${API_BASE}/api/v1/auto-apply/apply-one`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ job_id: pendingJob.id })
+        body: JSON.stringify({ job_id: pendingJob.id }),
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success) {
-          showToast(`⚡ Application successfully emailed to ${pendingJob.company} via Gmail! Sent to ${data.recipient_email || 'HR'}`);
-        } else {
-          showToast(data.message || data.error || `Failed to send email application.`, "error");
-        }
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showToast(data.message || `Email sent to ${pendingJob.company}!`);
+        fetchQuota();
+        fetchOpportunities();
       } else {
-        const errData = await res.json().catch(() => ({}));
-        showToast(errData.detail || `Failed to send email application (status ${res.status}).`, "error");
+        showToast(data.detail || data.error || data.message || "Failed to send email.", "error");
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to connect to backend application router.", "error");
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Failed to send email.", "error");
     } finally {
       setIsSendingEmail(false);
       setIsReviewModalOpen(false);
@@ -271,52 +244,30 @@ export default function OpportunitiesPage() {
     }
   };
 
-  // Auto-Apply Batch Handlers
-  const fetchAutoApplyStatus = useCallback(async () => {
-    if (!token) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/auto-apply/status`, {
-        headers: { "Authorization": `Bearer ${token}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setAutoApplyStatus(data);
-      }
-    } catch (err) {
-      console.error("Failed to fetch auto-apply status:", err);
-    }
-  }, [token]);
-
-  const handleStartAutoApply = async (jobCount: number, internshipCount: number) => {
+  const handleStartAutoApply = async (applyCount: number) => {
     setIsStartingAutoApply(true);
     try {
       const res = await fetch(`${API_BASE}/api/v1/auto-apply/start`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ job_count: jobCount, internship_count: internshipCount })
+        body: JSON.stringify({ apply_count: applyCount }),
       });
-
       if (res.ok) {
         const data = await res.json();
-        showToast(data.message || "Auto-apply started successfully!");
+        showToast(data.message || "Auto-apply started!");
         setIsAutoApplyModalOpen(false);
         fetchAutoApplyStatus();
       } else {
-        const errData = await res.json().catch(() => ({}));
-        showToast(errData.detail || `Failed to start auto-apply (status ${res.status}).`, "error");
+        showToast(await parseApiError(res, "Failed to start auto-apply"), "error");
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to connect to backend auto-apply router.", "error");
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Failed to start auto-apply.", "error");
     } finally {
       setIsStartingAutoApply(false);
     }
-  };
-
-  const openAutoApplyModal = () => {
-    setIsAutoApplyModalOpen(true);
   };
 
   const handleStopAutoApply = async () => {
@@ -324,14 +275,14 @@ export default function OpportunitiesPage() {
     try {
       const res = await fetch(`${API_BASE}/api/v1/auto-apply/stop`, {
         method: "POST",
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
         const data = await res.json();
         showToast(data.message || "Auto-apply stopped.");
         fetchAutoApplyStatus();
       }
-    } catch (err) {
+    } catch (err: unknown) {
       showToast(err instanceof Error ? err.message : "Failed to stop auto-apply.", "error");
     } finally {
       setIsStoppingAutoApply(false);
@@ -343,46 +294,18 @@ export default function OpportunitiesPage() {
     try {
       await fetch(`${API_BASE}/api/v1/auto-apply/dismiss`, {
         method: "POST",
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${token}` },
       });
-      setAutoApplyStatus(null);
-    } catch (err) {
-      console.error("Failed to dismiss auto-apply status:", err);
       setAutoApplyStatus(null);
     } finally {
       setIsDismissingAutoApply(false);
     }
   };
 
-  // Poll auto-apply status every 3 seconds while running
-  useEffect(() => {
-    if (!isAuthenticated || !token) return;
-    fetchAutoApplyStatus();
-    const interval = setInterval(() => {
-      fetchAutoApplyStatus();
-    }, 3000);
-    return () => clearInterval(interval);
-  }, [isAuthenticated, token, fetchAutoApplyStatus]);
-
-  // Filter jobs by selected target countries
-  // Convert selected country names (e.g. "United States 🇺🇸") to country codes ("us")
-  // to match against job.country which stores codes like "us", "gb", "de"
-  const selectedCountryCodes = selectedCountries.map(c => {
-    const name = normalizeCountryName(c).toLowerCase();
-    // Reverse lookup from name map
-    for (const [countryName, code] of Object.entries(COUNTRY_NAME_MAP)) {
-      if (countryName.toLowerCase() === name) return code;
-    }
-    // Try direct match (e.g. user typed "US" or "us")
-    return name === "usa" ? "us" : name;
+  const filteredDailyJobs = dailyJobs.filter((job) => {
+    if (selectedSource === "All") return true;
+    return (job.source || "").toLowerCase() === selectedSource.toLowerCase();
   });
-
-  const filteredDailyJobs = dailyJobs.filter(
-    (job) => {
-      if (!job.country) return true;
-      return selectedCountryCodes.includes(job.country.toLowerCase());
-    }
-  );
 
   return (
     <div className="min-h-screen bg-[#090a0f] bg-grid-omni text-slate-100 selection:bg-rose-500 selection:text-white">
@@ -393,12 +316,16 @@ export default function OpportunitiesPage() {
         <ErrorBoundary>
           <JobsTab
             filteredDailyJobs={filteredDailyJobs}
-            selectedCountries={selectedCountries}
+            selectedSource={selectedSource}
+            setSelectedSource={setSelectedSource}
+            sourceStats={sourceStats}
+            todayApplied={todayApplied}
+            dailyMax={dailyMax}
             isTriggeringSearch={isTriggeringSearch}
             handleTriggerSearchAgent={handleTriggerSearchAgent}
             isApplyingId={isApplyingId}
             handleAutoApply={handleAutoApply}
-            handleAutoApplyBatch={openAutoApplyModal}
+            handleAutoApplyBatch={() => setIsAutoApplyModalOpen(true)}
             isAutoApplyRunning={autoApplyStatus?.status === "running"}
             onStopAutoApply={handleStopAutoApply}
             isAutoApplyStopping={isStoppingAutoApply}
@@ -410,7 +337,6 @@ export default function OpportunitiesPage() {
         </ErrorBoundary>
       </main>
 
-      {/* Email Review Modal - shows before sending */}
       <EmailReviewModal
         isOpen={isReviewModalOpen}
         onClose={() => {
@@ -423,15 +349,15 @@ export default function OpportunitiesPage() {
         isSending={isSendingEmail}
       />
 
-      {/* Auto-Apply Modal - configure counts */}
       <AutoApplyModal
         isOpen={isAutoApplyModalOpen}
         onClose={() => setIsAutoApplyModalOpen(false)}
         onStart={handleStartAutoApply}
         isStarting={isStartingAutoApply}
+        todayApplied={todayApplied}
+        dailyMax={dailyMax}
       />
 
-      {/* Auto-Apply Progress Tracker - floating status panel */}
       <AutoApplyProgress
         status={autoApplyStatus}
         onStop={handleStopAutoApply}
@@ -440,7 +366,6 @@ export default function OpportunitiesPage() {
         isDismissing={isDismissingAutoApply}
       />
 
-      {/* Job Details Modal - shows full description with apply button */}
       <JobDetailsModal
         job={selectedJob}
         isOpen={isJobDetailsOpen}

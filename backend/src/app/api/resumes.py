@@ -10,19 +10,19 @@ from src.app.db.models import User, Profile, UserSettings
 from src.app.services.storage import get_storage_provider
 from src.app.core.config import settings
 from src.app.services.pdf_parser import extract_text_from_pdf
-from src.app.services.ats_checker import evaluate_resume_ats, extract_skills_and_summary_from_text
+from src.app.services.resume_parser import parse_resume_text
+from src.app.services.ats_checker import evaluate_resume_ats
+from src.app.services.llm_client import build_llm_config
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/resumes", tags=["resumes"])
 
 MAX_UPLOAD_SIZE_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
-
 ALLOWED_RESUME_EXTENSIONS = (".pdf", ".doc", ".docx", ".txt")
 
 
 def validate_resume_upload(file: UploadFile, content: bytes):
-    """Shared validation for resume uploads: extension, type and size."""
     filename = (file.filename or "").lower()
     if not filename.endswith(ALLOWED_RESUME_EXTENSIONS):
         raise HTTPException(
@@ -40,155 +40,175 @@ def validate_resume_upload(file: UploadFile, content: bytes):
             detail=f"File exceeds the maximum size of {settings.MAX_UPLOAD_SIZE_MB} MB.",
         )
 
+
 class ATSCheckRequest(BaseModel):
-    target_role: Optional[str] = Field(None, description="The job title or role to evaluate against")
-    job_description: Optional[str] = Field(None, description="Full job description text to run semantic keywords matching")
+    target_role: Optional[str] = Field(None, description="Target job title/role")
+    job_description: Optional[str] = Field(None, description="Optional job description")
+
 
 @router.post("/upload")
 def upload_resume(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
-    Upload and parse PDF resume file.
-    Extracts skills, experience, education, executive summary, and calculates real-time ATS score.
+    Upload resume file, extract full structured details (summary, skills, experience,
+    education, projects, contact links), and run ATS scoring.
     """
     uid = current_user.id
     content = file.file.read()
-
-    # Validate extension, non-empty, and file size
     validate_resume_upload(file, content)
 
-    # 1. Save file locally or to storage
     storage = get_storage_provider()
     file_url = storage.upload(content, file.filename)
-    
-    # 2. Extract text from PDF binary
-    raw_text = extract_text_from_pdf(content)
-    
-    # Apply user's saved LLM API key for parsing (if available)
-    user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
-    if user_settings and user_settings.openai_api_key:
-        import src.app.core.config as config_module
-        if user_settings.llm_provider == "gemini" or user_settings.openai_api_key.startswith("AIzaSy"):
-            config_module.settings.GEMINI_API_KEY = user_settings.openai_api_key
-        else:
-            config_module.settings.OPENAI_API_KEY = user_settings.openai_api_key
-        if user_settings.llm_model:
-            config_module.settings.OPENAI_MODEL = user_settings.llm_model
 
-    # 3. Extract candidate skills & executive summary via AI / Parser
-    parsed_info = extract_skills_and_summary_from_text(raw_text)
-    
-    # 4. Evaluate real-time ATS Score
-    ats_results = evaluate_resume_ats(parsed_info)
-    
-    # 5. Save or Update User Profile in Database
+    raw_text = extract_text_from_pdf(content)
+    user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
+    llm_cfg = build_llm_config(user_settings)
+
+    parsed_info = parse_resume_text(raw_text, llm_config=llm_cfg)
+    target_role = (
+        user_settings.target_roles[0]
+        if user_settings and user_settings.target_roles
+        else None
+    )
+    ats_results = evaluate_resume_ats(parsed_info, target_role=target_role, llm_config=llm_cfg)
+
     profile = db.query(Profile).filter(Profile.user_id == uid).first()
     if not profile:
         profile = Profile(user_id=uid)
         db.add(profile)
-    
+
     profile.resume_url = file_url
-    profile.summary = parsed_info["summary"]
-    profile.skills = parsed_info["skills"]
-    profile.experience = parsed_info["experience"]
-    profile.education = parsed_info["education"]
-    profile.projects = parsed_info["projects"]
-    profile.ats_score = ats_results.get("ats_score", 78)
-    profile.ats_suggestions = ats_results.get("ats_suggestions", {})
-    
-    db.commit()
-    db.refresh(profile)
-    
-    return {
-        "filename": file.filename,
-        "resume_url": file_url,
-        "skills": profile.skills,
-        "summary": profile.summary,
-        "ats_score": profile.ats_score,
+    profile.raw_resume_text = raw_text
+    if parsed_info.get("full_name"):
+        profile.full_name = parsed_info["full_name"]
+    if parsed_info.get("phone"):
+        profile.phone = parsed_info["phone"]
+    if parsed_info.get("github_url") and not profile.github_url:
+        profile.github_url = parsed_info["github_url"]
+    if parsed_info.get("linkedin_url") and not profile.other_url:
+        profile.other_url = parsed_info["linkedin_url"]
+    if parsed_info.get("portfolio_url") and not profile.portfolio_url:
+        profile.portfolio_url = parsed_info["portfolio_url"]
+
+    profile.summary = parsed_info.get("summary") or ""
+    profile.skills = parsed_info.get("skills") or []
+    profile.experience = parsed_info.get("experience") or []
+    profile.education = parsed_info.get("education") or []
+    profile.projects = parsed_info.get("projects") or []
+    profile.languages = parsed_info.get("languages") or []
+    profile.ats_score = ats_results.get("ats_score", 0)
+    profile.ats_breakdown = {
         "formatting_score": ats_results.get("formatting_score", 0),
         "keyword_density_score": ats_results.get("keyword_density_score", 0),
         "action_verbs_score": ats_results.get("action_verbs_score", 0),
         "section_completeness_score": ats_results.get("section_completeness_score", 0),
-        "ats_suggestions": profile.ats_suggestions
     }
+    profile.ats_suggestions = ats_results.get("ats_suggestions", {})
 
-@router.get("/profile")
-def get_resume_profile(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Retrieve the current authenticated user's structured resume profile, ATS score, and recommendations.
-    """
-    uid = current_user.id
-    profile = db.query(Profile).filter(Profile.user_id == uid).first()
-    
-    if not profile:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No resume profile found for this user. Please upload a resume first."
-        )
-        
+    db.commit()
+    db.refresh(profile)
+
     return {
-        "resume_url": profile.resume_url,
+        "filename": file.filename,
+        "resume_url": file_url,
+        "full_name": profile.full_name,
         "summary": profile.summary,
         "skills": profile.skills,
         "experience": profile.experience,
         "education": profile.education,
         "projects": profile.projects,
         "languages": profile.languages,
+        "github_url": profile.github_url,
+        "linkedin_url": profile.other_url,
+        "portfolio_url": profile.portfolio_url,
         "ats_score": profile.ats_score,
-        "formatting_score": getattr(profile, 'formatting_score', None),
-        "keyword_density_score": getattr(profile, 'keyword_density_score', None),
-        "action_verbs_score": getattr(profile, 'action_verbs_score', None),
-        "section_completeness_score": getattr(profile, 'section_completeness_score', None),
-        "ats_suggestions": profile.ats_suggestions
+        "formatting_score": profile.ats_breakdown.get("formatting_score", 0),
+        "keyword_density_score": profile.ats_breakdown.get("keyword_density_score", 0),
+        "action_verbs_score": profile.ats_breakdown.get("action_verbs_score", 0),
+        "section_completeness_score": profile.ats_breakdown.get("section_completeness_score", 0),
+        "ats_suggestions": profile.ats_suggestions,
     }
+
+
+@router.get("/profile")
+def get_resume_profile(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Retrieve the authenticated user's extracted resume profile, projects, and ATS score."""
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No resume profile found for this user. Please upload a resume first.",
+        )
+
+    breakdown = profile.ats_breakdown or {}
+    return {
+        "resume_url": profile.resume_url,
+        "full_name": profile.full_name,
+        "phone": profile.phone,
+        "summary": profile.summary,
+        "skills": profile.skills or [],
+        "experience": profile.experience or [],
+        "education": profile.education or [],
+        "projects": profile.projects or [],
+        "languages": profile.languages or [],
+        "ats_score": profile.ats_score,
+        "formatting_score": breakdown.get("formatting_score", 0),
+        "keyword_density_score": breakdown.get("keyword_density_score", 0),
+        "action_verbs_score": breakdown.get("action_verbs_score", 0),
+        "section_completeness_score": breakdown.get("section_completeness_score", 0),
+        "ats_suggestions": profile.ats_suggestions or {},
+    }
+
 
 @router.post("/ats-check")
 def run_ats_check(
     payload: ATSCheckRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Run an ad-hoc ATS grading checklist against a target job role or job description.
-    """
+    """Run an ATS evaluation on the user's parsed resume profile and projects."""
     uid = current_user.id
     profile = db.query(Profile).filter(Profile.user_id == uid).first()
-    
     if not profile:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No resume profile found for this user. Please upload a resume first to run an ATS check."
+            detail="No resume profile found. Please upload a resume first.",
         )
 
+    user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
+    llm_cfg = build_llm_config(user_settings)
     profile_data = {
-        "skills": profile.skills,
-        "experience": profile.experience,
-        "education": profile.education,
-        "projects": profile.projects,
-        "languages": profile.languages
+        "skills": profile.skills or [],
+        "experience": profile.experience or [],
+        "education": profile.education or [],
+        "projects": profile.projects or [],
+        "languages": profile.languages or [],
     }
-    
     target = payload.target_role or (payload.job_description[:100] if payload.job_description else None)
-    ats_results = evaluate_resume_ats(profile_data, target_role=target)
-    
-    if profile:
-        profile.ats_score = ats_results.get("ats_score")
-        profile.ats_suggestions = ats_results.get("ats_suggestions")
-        db.commit()
-        db.refresh(profile)
-    
-    # Return all ATS data including 4 detailed scores
-    return {
-        "ats_score": ats_results.get("ats_score"),
+    ats_results = evaluate_resume_ats(profile_data, target_role=target, llm_config=llm_cfg)
+
+    profile.ats_score = ats_results.get("ats_score")
+    profile.ats_breakdown = {
         "formatting_score": ats_results.get("formatting_score", 0),
         "keyword_density_score": ats_results.get("keyword_density_score", 0),
         "action_verbs_score": ats_results.get("action_verbs_score", 0),
         "section_completeness_score": ats_results.get("section_completeness_score", 0),
-        "ats_suggestions": ats_results.get("ats_suggestions", {})
+    }
+    profile.ats_suggestions = ats_results.get("ats_suggestions", {})
+    db.commit()
+    db.refresh(profile)
+
+    return {
+        "ats_score": profile.ats_score,
+        "formatting_score": profile.ats_breakdown["formatting_score"],
+        "keyword_density_score": profile.ats_breakdown["keyword_density_score"],
+        "action_verbs_score": profile.ats_breakdown["action_verbs_score"],
+        "section_completeness_score": profile.ats_breakdown["section_completeness_score"],
+        "ats_suggestions": profile.ats_suggestions,
     }

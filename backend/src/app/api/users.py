@@ -1,24 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from typing import Optional, List, Union
 from sqlalchemy.orm import Session
-import logging
 
 from src.app.db.database import get_db
+from src.app.core.config import settings as app_settings
 from src.app.core.security import get_current_user
-from src.app.services.storage import storage_service
 from src.app.db.models import User, Profile, UserSettings
-from src.app.core.config import settings
-
-from src.app.services.pdf_parser import extract_text_from_pdf
-from src.app.services.resume_parser import parse_resume_text
-from src.app.services.ats_checker import evaluate_resume_ats
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-MAX_UPLOAD_SIZE_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 class SettingsUpdateRequest(BaseModel):
     llm_provider: Optional[str] = None
@@ -27,16 +18,20 @@ class SettingsUpdateRequest(BaseModel):
     openai_api_key: Optional[str] = None
     google_client_id: Optional[str] = None
     google_client_secret: Optional[str] = None
-    adzuna_app_id: Optional[str] = None
-    adzuna_app_key: Optional[str] = None
-    jooble_api_key: Optional[str] = None
+    enabled_connectors: Optional[List[str]] = None
+    greenhouse_companies: Optional[List[str]] = None
+    serpapi_api_key: Optional[str] = None
     target_countries: Optional[List[str]] = None
+
 
 class ProfileUpdateRequest(BaseModel):
     email: Optional[str] = None
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
     portfolio_url: Optional[str] = None
     github_url: Optional[str] = None
     other_url: Optional[str] = None
+    job_details: Optional[str] = None
     target_roles: Optional[List[str]] = None
     target_countries: Optional[List[str]] = None
     work_mode_preference: Optional[str] = None
@@ -44,153 +39,134 @@ class ProfileUpdateRequest(BaseModel):
     salary_preference: Optional[str] = None
     experience_level: Optional[str] = None
     visa_sponsorship: Optional[Union[bool, str]] = None
-    # Also accept string-based visa preference labels from the UI
     visa_sponsorship_str: Optional[str] = None
-    daily_job_goal: Optional[int] = None
-    daily_internship_goal: Optional[int] = None
-    auto_fulfill_enabled: Optional[bool] = None
+    daily_apply_limit: Optional[int] = None
+
+
+def _mask_key(k: Optional[str]) -> str:
+    if not k or len(k) < 6:
+        return ""
+    return k[:4] + "••••••••" + k[-4:]
+
 
 @router.get("/me")
-def get_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Fetch the authenticated user's database record or initialize a new record if first time.
-    """
-    uid = current_user.id
-    email = current_user.email
-
-    user = db.query(User).filter(User.id == uid).first()
-    if not user:
-        user = User(id=uid, email=email)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    
+def get_me(current_user: User = Depends(get_current_user)):
+    """Fetch the authenticated user's summary record."""
     return {
-        "id": user.id,
-        "email": user.email,
-        "created_at": user.created_at,
+        "id": current_user.id,
+        "email": current_user.email,
+        "created_at": current_user.created_at,
         "profile": {
-            "resume_url": user.profile.resume_url if user.profile else None,
-            "skills": user.profile.skills if user.profile else [],
-            "ats_score": user.profile.ats_score if user.profile else None
-        } if user.profile else None
+            "resume_url": current_user.profile.resume_url,
+            "skills": current_user.profile.skills or [],
+            "projects": current_user.profile.projects or [],
+            "ats_score": current_user.profile.ats_score,
+        } if current_user.profile else None,
     }
+
 
 @router.get("/settings")
 def get_user_settings(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Fetch user API keys and integration credentials.
-    """
+    """Fetch user preferences, job details, AI vault config, and connector settings."""
     uid = current_user.id
-    settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
-    if not settings:
-        settings = UserSettings(user_id=uid)
-        db.add(settings)
+    user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
+    if not user_settings:
+        user_settings = UserSettings(user_id=uid)
+        db.add(user_settings)
         db.commit()
-        db.refresh(settings)
+        db.refresh(user_settings)
 
     profile = db.query(Profile).filter(Profile.user_id == uid).first()
-    
-    user = db.query(User).filter(User.id == uid).first()
-
-    # Return masked secret keys for security
-    def mask_key(k: Optional[str]):
-        if not k or len(k) < 6:
-            return ""
-        return k[:4] + "••••••••" + k[-4:]
 
     return {
-        "llm_provider": settings.llm_provider or "openai",
-        "llm_model": settings.llm_model or "gpt-4o",
-        "custom_api_base": settings.custom_api_base or "",
-        "openai_api_key": mask_key(settings.openai_api_key),
-        "google_client_id": settings.google_client_id or "",
-        "google_client_secret": mask_key(settings.google_client_secret),
-        "adzuna_app_id": settings.adzuna_app_id or "",
-        "adzuna_app_key": mask_key(settings.adzuna_app_key),
-        "jooble_api_key": mask_key(settings.jooble_api_key),
-        "is_gmail_connected": settings.is_gmail_connected,
-        "gmail_email_address": settings.gmail_email_address or "",
-        "target_roles": settings.target_roles or [],
-        "target_countries": settings.preferred_countries or [],
-        "work_mode_preference": settings.work_mode_preference or "Fully Remote (Worldwide)",
-        "salary_preference": settings.min_salary_preference or "$90,000 - $130,000 / year",
-        "experience_level": settings.experience_level or "Mid-Level (2 - 5 Yrs)",
-        "visa_sponsorship": settings.visa_sponsorship_required,
-        "visa_sponsorship_str": getattr(settings, "visa_sponsorship_preference", None) or ("Visa Sponsorship Required" if settings.visa_sponsorship_required else "No Visa Needed (Authorized Work Permit)"),
-        "daily_job_goal": settings.daily_job_goal,
-        "daily_internship_goal": settings.daily_internship_goal,
-        "auto_fulfill_enabled": settings.auto_fulfill_enabled,
-        "email": user.email if user else "",
+        "llm_provider": user_settings.llm_provider or "openai",
+        "llm_model": user_settings.llm_model or "gpt-4o-mini",
+        "custom_api_base": user_settings.custom_api_base or "",
+        "openai_api_key": _mask_key(user_settings.openai_api_key),
+        "google_client_id": user_settings.google_client_id or "",
+        "google_client_secret": _mask_key(user_settings.google_client_secret),
+        "enabled_connectors": user_settings.enabled_connectors if user_settings.enabled_connectors is not None else ["linkedin", "indeed", "google", "greenhouse"],
+        "greenhouse_companies": user_settings.greenhouse_companies or app_settings.TRACKED_COMPANIES_GREENHOUSE,
+        "serpapi_api_key": _mask_key(user_settings.serpapi_api_key),
+        "is_gmail_connected": user_settings.is_gmail_connected,
+        "gmail_email_address": user_settings.gmail_email_address or "",
+        "job_details": user_settings.job_details or "",
+        "target_roles": user_settings.target_roles or [],
+        "target_countries": user_settings.preferred_countries or [],
+        "work_mode_preference": user_settings.work_mode_preference or "Fully Remote (Worldwide)",
+        "salary_preference": user_settings.min_salary_preference or "$90,000 - $130,000 / year",
+        "experience_level": user_settings.experience_level or "Mid-Level (2 - 5 Yrs)",
+        "visa_sponsorship": user_settings.visa_sponsorship_required,
+        "visa_sponsorship_str": user_settings.visa_sponsorship_preference
+            or ("Visa Sponsorship Required" if user_settings.visa_sponsorship_required else "No Visa Needed (Authorized Work Permit)"),
+        "daily_apply_limit": min(user_settings.daily_apply_limit or app_settings.DAILY_APPLY_MAX, app_settings.DAILY_APPLY_MAX),
+        "email": current_user.email,
+        "full_name": profile.full_name if profile else "",
+        "phone": profile.phone if profile else "",
         "portfolio_url": profile.portfolio_url if profile else "",
         "github_url": profile.github_url if profile else "",
         "other_url": profile.other_url if profile else "",
-        "employment_types": profile.employment_types if profile else []
+        "employment_types": profile.employment_types if profile else [],
     }
+
 
 @router.put("/settings")
 def update_user_settings(
     payload: SettingsUpdateRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Update and save user API keys and integration credentials.
-    """
+    """Update AI provider credentials, Gmail OAuth app settings, and job source configuration."""
     uid = current_user.id
-    settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
-    if not settings:
-        settings = UserSettings(user_id=uid)
-        db.add(settings)
+    user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
+    if not user_settings:
+        user_settings = UserSettings(user_id=uid)
+        db.add(user_settings)
 
     if payload.llm_provider is not None:
-        settings.llm_provider = payload.llm_provider
+        user_settings.llm_provider = payload.llm_provider
     if payload.llm_model is not None:
-        settings.llm_model = payload.llm_model
+        user_settings.llm_model = payload.llm_model
     if payload.custom_api_base is not None:
-        settings.custom_api_base = payload.custom_api_base
+        user_settings.custom_api_base = payload.custom_api_base
     if payload.openai_api_key is not None and "••••••••" not in payload.openai_api_key:
-        settings.openai_api_key = payload.openai_api_key
+        user_settings.openai_api_key = payload.openai_api_key
     if payload.google_client_id is not None:
-        settings.google_client_id = payload.google_client_id
+        user_settings.google_client_id = payload.google_client_id
     if payload.google_client_secret is not None and "••••••••" not in payload.google_client_secret:
-        settings.google_client_secret = payload.google_client_secret
-    if payload.adzuna_app_id is not None:
-        settings.adzuna_app_id = payload.adzuna_app_id
-    if payload.adzuna_app_key is not None and "••••••••" not in payload.adzuna_app_key:
-        settings.adzuna_app_key = payload.adzuna_app_key
-    if payload.jooble_api_key is not None and "••••••••" not in payload.jooble_api_key:
-        settings.jooble_api_key = payload.jooble_api_key
+        user_settings.google_client_secret = payload.google_client_secret
+    if payload.enabled_connectors is not None:
+        allowed = {"linkedin", "indeed", "google", "greenhouse"}
+        user_settings.enabled_connectors = [c.lower() for c in payload.enabled_connectors if c.lower() in allowed]
+    if payload.greenhouse_companies is not None:
+        user_settings.greenhouse_companies = [c.strip().lower() for c in payload.greenhouse_companies if c.strip()]
+    if payload.serpapi_api_key is not None and "••••••••" not in payload.serpapi_api_key:
+        user_settings.serpapi_api_key = payload.serpapi_api_key
     if payload.target_countries is not None:
-        settings.preferred_countries = payload.target_countries
+        user_settings.preferred_countries = payload.target_countries
 
     db.commit()
     return {"status": "success", "message": "API keys and integration settings saved successfully!"}
+
 
 @router.put("/profile")
 def update_user_profile(
     payload: ProfileUpdateRequest,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Update and save user profile and career preferences.
-    """
+    """Update user profile links, job details ('what type of work they do'), and daily apply cap."""
     uid = current_user.id
-    
-    # Ensure User record exists
-    user = db.query(User).filter(User.id == uid).first()
-    if not user:
-        user = User(id=uid, email=current_user.email or f"{uid}@local.com")
-        db.add(user)
-        db.commit()
-    
-    # Update User Profile
+
     profile = db.query(Profile).filter(Profile.user_id == uid).first()
     if not profile:
         profile = Profile(user_id=uid)
         db.add(profile)
-        
+
+    if payload.full_name is not None:
+        profile.full_name = payload.full_name
+    if payload.phone is not None:
+        profile.phone = payload.phone
     if payload.portfolio_url is not None:
         profile.portfolio_url = payload.portfolio_url
     if payload.github_url is not None:
@@ -200,128 +176,47 @@ def update_user_profile(
     if payload.employment_types is not None:
         profile.employment_types = payload.employment_types
 
-    # Update User Settings
-    settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
-    if not settings:
-        settings = UserSettings(user_id=uid)
-        db.add(settings)
-        
+    user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
+    if not user_settings:
+        user_settings = UserSettings(user_id=uid)
+        db.add(user_settings)
+
+    if payload.job_details is not None:
+        user_settings.job_details = payload.job_details
     if payload.target_roles is not None:
-        settings.target_roles = payload.target_roles
+        user_settings.target_roles = [r.strip() for r in payload.target_roles if r.strip()]
     if payload.target_countries is not None:
-        settings.preferred_countries = payload.target_countries
+        user_settings.preferred_countries = payload.target_countries
     if payload.work_mode_preference is not None:
-        settings.work_mode_preference = payload.work_mode_preference
+        user_settings.work_mode_preference = payload.work_mode_preference
     if payload.salary_preference is not None:
-        settings.min_salary_preference = payload.salary_preference
+        user_settings.min_salary_preference = payload.salary_preference
     if payload.experience_level is not None:
-        settings.experience_level = payload.experience_level
-    # Handle visa sponsorship
+        user_settings.experience_level = payload.experience_level
+
     if payload.visa_sponsorship is not None:
         if isinstance(payload.visa_sponsorship, str):
-            settings.visa_sponsorship_preference = payload.visa_sponsorship
+            user_settings.visa_sponsorship_preference = payload.visa_sponsorship
             visa_str = payload.visa_sponsorship.lower()
-            settings.visa_sponsorship_required = any(
-                keyword in visa_str for keyword in ["required", "needed", "need", "sponsorship"]
+            user_settings.visa_sponsorship_required = any(
+                kw in visa_str for kw in ("required", "needed", "need", "sponsorship")
             ) and "no visa" not in visa_str and "not required" not in visa_str
         else:
-            settings.visa_sponsorship_required = payload.visa_sponsorship
-            settings.visa_sponsorship_preference = "Visa Sponsorship Required" if payload.visa_sponsorship else "No Visa Needed (Authorized Work Permit)"
+            user_settings.visa_sponsorship_required = payload.visa_sponsorship
+            user_settings.visa_sponsorship_preference = (
+                "Visa Sponsorship Required"
+                if payload.visa_sponsorship
+                else "No Visa Needed (Authorized Work Permit)"
+            )
     if payload.visa_sponsorship_str is not None:
-        settings.visa_sponsorship_preference = payload.visa_sponsorship_str
+        user_settings.visa_sponsorship_preference = payload.visa_sponsorship_str
         visa_str = payload.visa_sponsorship_str.lower()
-        settings.visa_sponsorship_required = any(
-            keyword in visa_str for keyword in ["required", "needed", "need", "sponsorship"]
+        user_settings.visa_sponsorship_required = any(
+            kw in visa_str for kw in ("required", "needed", "need", "sponsorship")
         ) and "no visa" not in visa_str and "not required" not in visa_str
-    if payload.daily_job_goal is not None:
-        settings.daily_job_goal = payload.daily_job_goal
-    if payload.daily_internship_goal is not None:
-        settings.daily_internship_goal = payload.daily_internship_goal
-    if payload.auto_fulfill_enabled is not None:
-        settings.auto_fulfill_enabled = payload.auto_fulfill_enabled
+
+    if payload.daily_apply_limit is not None:
+        user_settings.daily_apply_limit = max(1, min(int(payload.daily_apply_limit), app_settings.DAILY_APPLY_MAX))
 
     db.commit()
-    return {"status": "success", "message": "Profile and preferences updated successfully!"}
-
-@router.post("/resume")
-async def upload_resume(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Upload user's resume PDF, save to storage, and link the URL to the user's profile.
-    """
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF resume files are accepted."
-        )
-
-    content = await file.read()
-
-    if not content or not content.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uploaded file is empty.",
-        )
-    if len(content) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File exceeds the maximum size of {settings.MAX_UPLOAD_SIZE_MB} MB.",
-        )
-
-    file_url = storage_service.upload(content, file.filename)
-    
-    uid = current_user.id
-    user = db.query(User).filter(User.id == uid).first()
-    if not user:
-        user = User(id=uid, email=current_user.email)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-    profile = db.query(Profile).filter(Profile.user_id == uid).first()
-    if not profile:
-        profile = Profile(user_id=uid, resume_url=file_url)
-        db.add(profile)
-    else:
-        profile.resume_url = file_url
-        
-    db.commit()
-    db.refresh(profile)
-
-    try:
-        raw_text = extract_text_from_pdf(content)
-        
-        # Apply user's saved LLM API key for parsing (if available)
-        user_settings = db.query(UserSettings).filter(UserSettings.user_id == uid).first()
-        if user_settings and user_settings.openai_api_key:
-            import src.app.core.config as config_module
-            if user_settings.llm_provider == "gemini" or user_settings.openai_api_key.startswith("AIzaSy"):
-                config_module.settings.GEMINI_API_KEY = user_settings.openai_api_key
-            else:
-                config_module.settings.OPENAI_API_KEY = user_settings.openai_api_key
-            if user_settings.llm_model:
-                config_module.settings.OPENAI_MODEL = user_settings.llm_model
-        
-        profile_data = parse_resume_text(raw_text)
-        ats_results = evaluate_resume_ats(profile_data)
-        
-        profile.skills = profile_data.get("skills", [])
-        profile.experience = profile_data.get("experience", [])
-        profile.education = profile_data.get("education", [])
-        profile.projects = profile_data.get("projects", [])
-        profile.languages = profile_data.get("languages", [])
-        profile.ats_score = ats_results.get("ats_score")
-        profile.ats_suggestions = ats_results.get("ats_suggestions")
-        
-        db.commit()
-        db.refresh(profile)
-    except Exception as parse_error:
-        logger.error(f"Failed to parse resume for user {uid}: {parse_error}", exc_info=True)
-
-    return {
-        "message": "Resume uploaded and parsed successfully.",
-        "resume_url": file_url
-    }
+    return {"status": "success", "message": "Profile, job details, and preferences saved!"}

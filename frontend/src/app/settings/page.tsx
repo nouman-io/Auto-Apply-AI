@@ -2,43 +2,35 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
+import { API_BASE, parseApiError } from "../lib/api";
 import Navbar from "../components/Navbar";
 import SettingsTab from "../components/SettingsTab";
 import ErrorBoundary from "../components/ErrorBoundary";
 import Toast from "../components/Toast";
 import GmailModal from "../components/GmailModal";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-
 export default function SettingsPage() {
   const { token, isAuthenticated } = useAuth();
 
   const [showApiKeys, setShowApiKeys] = useState(false);
   const [llmProvider, setLlmProvider] = useState("openai");
-  const [llmModel, setLlmModel] = useState("gpt-4o");
+  const [llmModel, setLlmModel] = useState("gpt-4o-mini");
   const [customApiBase, setCustomApiBase] = useState("");
   const [openaiApiKey, setOpenaiApiKey] = useState("");
   const [googleClientId, setGoogleClientId] = useState("");
   const [googleClientSecret, setGoogleClientSecret] = useState("");
-  const [adzunaAppId, setAdzunaAppId] = useState("");
-  const [adzunaAppKey, setAdzunaAppKey] = useState("");
-  const [joobleApiKey, setJoobleApiKey] = useState("");
+  const [greenhouseCompanies, setGreenhouseCompanies] = useState(
+    "vercel, openai, cloudflare, anthropic, stripe, figma"
+  );
+  const [serpapiApiKey, setSerpapiApiKey] = useState("");
   const [isSavingApiSettings, setIsSavingApiSettings] = useState(false);
-  const [selectedCountries, setSelectedCountries] = useState<string[]>([
-    "United States", "United Kingdom", "Canada", "Australia",
-    "Germany", "France", "Singapore", "Netherlands",
-    "Sweden", "Switzerland", "United Arab Emirates"
-  ]);
 
-  // Gmail modal & connection status in settings
   const [isGmailConnected, setIsGmailConnected] = useState(false);
   const [gmailEmail, setGmailEmail] = useState("");
   const [showGmailModal, setShowGmailModal] = useState(false);
   const [smtpPassword, setSmtpPassword] = useState("");
 
-  // Toast Notification State
   const [notification, setNotification] = useState<{ message: string; type: "success" | "error" } | null>(null);
-
   const showToast = (message: string, type: "success" | "error" = "success") => {
     setNotification({ message, type });
     setTimeout(() => {
@@ -50,7 +42,7 @@ export default function SettingsPage() {
     if (!token) return;
     try {
       const res = await fetch(`${API_BASE}/api/v1/auth/gmail/status`, {
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
         const data = await res.json();
@@ -66,7 +58,7 @@ export default function SettingsPage() {
     if (!token) return;
     try {
       const res = await fetch(`${API_BASE}/api/v1/users/settings`, {
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
         const data = await res.json();
@@ -76,15 +68,13 @@ export default function SettingsPage() {
         if (data.openai_api_key) setOpenaiApiKey(data.openai_api_key);
         if (data.google_client_id) setGoogleClientId(data.google_client_id);
         if (data.google_client_secret) setGoogleClientSecret(data.google_client_secret);
-        if (data.adzuna_app_id) setAdzunaAppId(data.adzuna_app_id);
-        if (data.adzuna_app_key) setAdzunaAppKey(data.adzuna_app_key);
-        if (data.jooble_api_key) setJoobleApiKey(data.jooble_api_key);
-        if (data.target_countries?.length) {
-          setSelectedCountries(data.target_countries);
+        if (data.greenhouse_companies?.length) {
+          setGreenhouseCompanies(data.greenhouse_companies.join(", "));
         }
+        if (data.serpapi_api_key) setSerpapiApiKey(data.serpapi_api_key);
       }
     } catch (err) {
-      console.error("Failed to fetch user API settings:", err);
+      console.error("Failed to fetch user settings:", err);
     }
   }, [token]);
 
@@ -102,7 +92,7 @@ export default function SettingsPage() {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           llm_provider: llmProvider,
@@ -111,19 +101,20 @@ export default function SettingsPage() {
           openai_api_key: openaiApiKey,
           google_client_id: googleClientId,
           google_client_secret: googleClientSecret,
-          adzuna_app_id: adzunaAppId,
-          adzuna_app_key: adzunaAppKey,
-          jooble_api_key: joobleApiKey,
-          target_countries: selectedCountries
-        })
+          greenhouse_companies: greenhouseCompanies
+            .split(",")
+            .map((c) => c.trim().toLowerCase())
+            .filter(Boolean),
+          serpapi_api_key: serpapiApiKey,
+        }),
       });
       if (res.ok) {
-        showToast("Successfully saved API keys & integration credentials!");
+        showToast("Settings saved successfully!");
       } else {
-        showToast("Failed to save API settings.", "error");
+        showToast(await parseApiError(res, "Failed to save settings"), "error");
       }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Failed to save API settings.", "error");
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : "Failed to save settings.", "error");
     } finally {
       setIsSavingApiSettings(false);
     }
@@ -133,7 +124,7 @@ export default function SettingsPage() {
     <div className="min-h-screen bg-[#090a0f] bg-grid-omni text-slate-100 selection:bg-rose-500 selection:text-white">
       <Toast notification={notification} />
       <Navbar />
-      
+
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <ErrorBoundary>
           <SettingsTab
@@ -145,9 +136,8 @@ export default function SettingsPage() {
             googleClientId={googleClientId} setGoogleClientId={setGoogleClientId}
             googleClientSecret={googleClientSecret} setGoogleClientSecret={setGoogleClientSecret}
             isGmailConnected={isGmailConnected} gmailEmail={gmailEmail} setShowGmailModal={setShowGmailModal}
-            adzunaAppId={adzunaAppId} setAdzunaAppId={setAdzunaAppId}
-            adzunaAppKey={adzunaAppKey} setAdzunaAppKey={setAdzunaAppKey}
-            joobleApiKey={joobleApiKey} setJoobleApiKey={setJoobleApiKey}
+            greenhouseCompanies={greenhouseCompanies} setGreenhouseCompanies={setGreenhouseCompanies}
+            serpapiApiKey={serpapiApiKey} setSerpapiApiKey={setSerpapiApiKey}
             isSavingApiSettings={isSavingApiSettings} handleSaveApiSettings={handleSaveApiSettings}
           />
         </ErrorBoundary>
@@ -169,6 +159,7 @@ export default function SettingsPage() {
           setGoogleClientId={setGoogleClientId}
           googleClientSecret={googleClientSecret}
           setGoogleClientSecret={setGoogleClientSecret}
+          isGmailConnected={isGmailConnected}
         />
       )}
     </div>

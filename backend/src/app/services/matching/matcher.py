@@ -1,234 +1,188 @@
-import re
-import logging
-from sqlalchemy.orm import Session
-from src.app.db.models import User, Profile, UserSettings, JobFound
-from src.app.core.config import settings
-import httpx
 import json
-from src.app.services.llm_client import get_llm_headers_and_url, is_llm_configured
+import logging
+import re
+from typing import List, Dict, Any
+from sqlalchemy.orm import Session
+from src.app.core.config import settings
+from src.app.db.models import Profile, UserSettings, JobFound
+from src.app.services.llm_client import build_llm_config, is_llm_configured, call_llm_json
 
 logger = logging.getLogger(__name__)
+
+STOP_WORDS = {
+    "with", "that", "this", "from", "your", "have", "will", "work", "team",
+    "role", "building", "using", "based", "into", "over", "more", "years",
+    "experience", "looking", "developer", "engineer", "software", "applications",
+}
+
+
+def _extract_project_keywords(projects: List[dict]) -> List[str]:
+    tokens = []
+    for proj in projects or []:
+        if not isinstance(proj, dict):
+            continue
+        for tech in proj.get("technologies") or []:
+            if isinstance(tech, str) and len(tech.strip()) >= 2:
+                tokens.append(tech.strip())
+        text = f"{proj.get('name') or proj.get('title') or ''} {proj.get('description') or ''}"
+        for word in re.findall(r"[a-zA-Z][a-zA-Z0-9+#.]{2,}", text):
+            if word.lower() not in STOP_WORDS:
+                tokens.append(word)
+    return list(dict.fromkeys(tokens))[:25]
+
+
+def _extract_job_detail_keywords(job_details: str, target_roles: List[str]) -> List[str]:
+    text = f"{job_details or ''} {' '.join(target_roles or [])}"
+    words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z0-9+#.]{2,}", text) if w.lower() not in STOP_WORDS]
+    return list(dict.fromkeys(words))[:20]
+
 
 class MatchingEngine:
     async def evaluate_job_match(self, db: Session, user_id: str, job_id: int) -> dict:
         """
-        Evaluates an opportunity against user settings (hard constraints) and profile (semantic search).
-        Returns a dictionary with match result details:
-            is_match: bool
-            score: float (0.0 to 1.0)
-            reasons: list of strings
+        Evaluate a job against user's resume details, projects, job details, and constraints.
+        Returns {is_match, score (0.0-1.0), score_pct (0-100), reasons}.
         """
-        reasons = []
+        reasons: List[str] = []
 
-        # 1. Fetch user data
         profile = db.query(Profile).filter(Profile.user_id == user_id).first()
         user_settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
         job = db.query(JobFound).filter(JobFound.id == job_id).first()
 
-        if not profile:
-            return {"is_match": False, "score": 0.0, "reasons": ["Resume profile not uploaded/parsed."]}
         if not job:
-            return {"is_match": False, "score": 0.0, "reasons": ["Job opportunity not found."]}
+            return {"is_match": False, "score": 0.0, "score_pct": 0, "reasons": ["Job opportunity not found."]}
 
-        # If user settings do not exist, create a default one
+        if not profile:
+            return {"is_match": False, "score": 0.0, "score_pct": 0, "reasons": ["Resume profile not uploaded yet."]}
+
         if not user_settings:
             user_settings = UserSettings(user_id=user_id)
             db.add(user_settings)
             db.commit()
             db.refresh(user_settings)
 
-        # 2. Run Hard Constraints Checks
-        
-        # A. Location & Preferred Countries Constraint
-        if user_settings.preferred_countries:
-            job_location = (job.location or "").lower()
-            country_matched = False
-            for country in user_settings.preferred_countries:
-                if country.lower() in job_location:
-                    country_matched = True
-                    break
-            if not country_matched:
-                logger.info(f"Job {job_id} filtered out due to location constraint: {job.location}")
+        job_text = f"{job.title} {job.location or ''} {job.description or ''}".lower()
+
+        # Hard Constraint: Work mode
+        if user_settings.work_mode_preference:
+            pref_lower = user_settings.work_mode_preference.lower()
+            is_remote_job = any(w in job_text for w in ("remote", "work from home", "wfh", "telecommute"))
+            if "remote" in pref_lower and not is_remote_job and any(
+                w in job_text for w in ("onsite only", "strictly onsite", "in-office only")
+            ):
                 return {
                     "is_match": False,
-                    "score": 0.0,
-                    "reasons": [f"Location '{job.location}' does not match preferred countries: {user_settings.preferred_countries}."]
+                    "score": 0.1,
+                    "score_pct": 10,
+                    "reasons": ["Job requires strictly on-site presence while preference is remote."],
                 }
 
-        # B. Remote Preference Constraint
-        job_text = f"{job.title} {job.location} {job.description}".lower()
-        is_remote_job = any(w in job_text for w in ["remote", "work from home", "wfh", "telecommute"])
-        
-        if user_settings.work_mode_preference and "remote" in user_settings.work_mode_preference.lower() and not is_remote_job:
-            # Reject if job is strictly onsite
-            if "onsite" in job_text or "in-office" in job_text or "in person" in job_text:
-                return {
-                    "is_match": False,
-                    "score": 0.0,
-                    "reasons": ["User prefers remote roles, but this opportunity requires onsite work."]
-                }
-        elif user_settings.work_mode_preference and "onsite" in user_settings.work_mode_preference.lower() and is_remote_job:
-            # Check if strictly remote (no hybrid or onsite option mentioned)
-            if "100% remote" in job_text or "fully remote" in job_text:
-                return {
-                    "is_match": False,
-                    "score": 0.0,
-                    "reasons": ["User prefers onsite roles, but this opportunity is fully remote."]
-                }
-
-        # C. Visa Sponsorship Constraint
+        # Hard Constraint: Visa sponsorship
         if user_settings.visa_sponsorship_required:
-            # Look for negative sponsorship keywords in job description
-            negative_sponsorship_phrases = [
+            negative_visa = (
                 "no sponsorship",
                 "does not offer sponsorship",
                 "unable to sponsor",
                 "cannot sponsor",
                 "us citizen or green card only",
                 "visa sponsorship is not available",
-                "sponsor visa: no"
-            ]
-            if any(phrase in job_text for phrase in negative_sponsorship_phrases):
+            )
+            if any(phrase in job_text for phrase in negative_visa):
                 return {
                     "is_match": False,
-                    "score": 0.0,
-                    "reasons": ["Visa sponsorship required, but the job description explicitly rules it out."]
+                    "score": 0.1,
+                    "score_pct": 10,
+                    "reasons": ["Visa sponsorship required, but posting rules out sponsorship."],
                 }
 
-        # D. Salary Constraint
-        if user_settings.min_salary_preference:
-            min_sal_str = re.sub(r'[^\d.]', '', user_settings.min_salary_preference)
-            if min_sal_str:
-                min_sal = float(min_sal_str)
-            job_salary_text = (job.salary or "").lower()
-            # Extract numbers from salary text
-            salary_numbers = [float(s) for s in re.findall(r"\d+[\d,]*", job_salary_text.replace(",", ""))]
-            if salary_numbers:
-                max_job_salary = max(salary_numbers)
-                # Handle cases where salary is in thousands (e.g. 120 instead of 120000)
-                if max_job_salary < 1000 and min_sal >= 1000:
-                    max_job_salary *= 1000
-                if max_job_salary < min_sal:
-                    return {
-                        "is_match": False,
-                        "score": 0.0,
-                        "reasons": [f"Offered salary {job.salary} is below user's minimum of ${min_sal:,.2f}."]
-                    }
-
-        # 3. Calculate Semantic Match via LLM
-        semantic_score = 0.5 # Default middle score if embedding fails
-        try:
-            user_api_key = user_settings.openai_api_key if user_settings else None
-            user_provider = user_settings.llm_provider if user_settings else None
-            user_model = user_settings.llm_model if user_settings else None
-            user_api_base = user_settings.custom_api_base if user_settings else None
-
-            if is_llm_configured(api_key=user_api_key, provider=user_provider, custom_api_base=user_api_base):
-                headers, url, model = get_llm_headers_and_url(
-                    api_key=user_api_key,
-                    provider=user_provider,
-                    model_name=user_model,
-                    custom_api_base=user_api_base
-                )
-                
-                profile_data = {
-                    "skills": profile.skills,
-                    "experience": profile.experience,
-                    "education": profile.education,
-                }
-                
-                prompt = f"""
-                You are an expert technical recruiter. Evaluate the candidate's profile against this job description.
-                Job Title: {job.title}
-                Job Description: {job.description}
-                
-                Candidate Profile:
-                {json.dumps(profile_data, indent=2)}
-                
-                Return a JSON object with:
-                - score: float between 0.0 and 1.0 representing how well the candidate matches the job.
-                - reason: a short string explaining the score.
-                
-                Return ONLY valid JSON.
-                """
-                
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a recruitment AI. Respond ONLY in valid raw JSON format without markdown codeblocks or extra text."
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
-                }
-                
-                with httpx.Client(timeout=30.0) as client:
-                    response = client.post(url, json=payload, headers=headers)
-                    if response.status_code == 200:
-                        content = response.json()["choices"][0]["message"]["content"].strip()
-                        if content.startswith("```json"):
-                            content = content.replace("```json", "").replace("```", "").strip()
-                        elif content.startswith("```"):
-                            content = content.replace("```", "").strip()
-                        
-                        try:
-                            result = json.loads(content)
-                            semantic_score = float(result.get("score", 0.5))
-                            llm_reason = result.get("reason", "No specific reason provided.")
-                            reasons.append(f"LLM Match Score: {semantic_score:.1%} - {llm_reason}")
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse LLM response: {content}")
-                            reasons.append("LLM matching service returned invalid response, utilizing keyword fallback.")
-                    else:
-                        if response.status_code == 401:
-                            logger.info("LLM matching service unauthorized (401). Utilizing keyword matching fallback.")
-                        else:
-                            logger.warning(f"LLM matching service returned status {response.status_code}.")
-                        reasons.append("LLM matching service returned an error, utilizing keyword fallback.")
-            else:
-                reasons.append("LLM matching service not configured, utilizing keyword fallback.")
-        except Exception as ve:
-            logger.error(f"Semantic evaluation failed: {ve}")
-            reasons.append("LLM evaluation unavailable, utilizing keyword fallback.")
-
-        # 4. Heuristic Keyword Matching
-        keyword_score = 0.0
-        matched_skills = []
+        # 1. Resume Skills Match
         user_skills = profile.skills or []
-        
-        if user_skills:
-            for skill in user_skills:
-                # Use word-boundary regex to prevent partial match issues (e.g. 'Go' matching 'Google')
-                pattern = rf"\b{re.escape(skill.lower())}\b"
-                if re.search(pattern, job_text):
-                    matched_skills.append(skill)
-            
-            keyword_score = len(matched_skills) / max(1, len(user_skills))
-            # Normalize keyword score to a reasonable ceiling to prevent scaling issues
-            keyword_score = min(1.0, keyword_score * 1.5)
-            
-            if matched_skills:
-                reasons.append(f"Matched skills: {', '.join(matched_skills[:8])}.")
-            else:
-                reasons.append("No direct skill keywords found in the job description.")
-        else:
-            reasons.append("User profile does not contain any skills.")
+        matched_skills = []
+        for skill in user_skills:
+            if re.search(rf"(?<!\w){re.escape(skill.lower())}(?!\w)", job_text):
+                matched_skills.append(skill)
+        skill_score = min(1.0, (len(matched_skills) / max(1, min(len(user_skills), 8))) * 1.1) if user_skills else 0.0
+        if matched_skills:
+            reasons.append(f"Skills match ({len(matched_skills)}): {', '.join(matched_skills[:6])}")
 
-        # 5. Composite Ranking Score
-        composite_score = (0.7 * semantic_score) + (0.3 * keyword_score)
-        
-        is_above_threshold = composite_score >= settings.MATCHING_THRESHOLD
-        if is_above_threshold:
-            reasons.insert(0, f"Strong match score of {composite_score:.1%}.")
-        else:
-            reasons.insert(0, f"Match score of {composite_score:.1%} is below threshold of {settings.MATCHING_THRESHOLD:.1%}.")
+        # 2. Resume Projects Match
+        project_keywords = _extract_project_keywords(profile.projects or [])
+        matched_proj_kw = [
+            kw for kw in project_keywords
+            if re.search(rf"(?<!\w){re.escape(kw.lower())}(?!\w)", job_text)
+        ]
+        project_score = min(1.0, (len(matched_proj_kw) / max(1, min(len(project_keywords), 6))) * 1.1) if project_keywords else 0.0
+        if matched_proj_kw:
+            reasons.append(f"Projects alignment: {', '.join(matched_proj_kw[:5])}")
+
+        # 3. Job Detail ("what type of work they do") & Target Role Alignment
+        detail_keywords = _extract_job_detail_keywords(
+            user_settings.job_details or "",
+            user_settings.target_roles or [],
+        )
+        matched_detail_kw = [
+            kw for kw in detail_keywords
+            if re.search(rf"(?<!\w){re.escape(kw.lower())}(?!\w)", f"{job.title.lower()} {job_text}")
+        ]
+        role_score = min(1.0, (len(matched_detail_kw) / max(1, min(len(detail_keywords), 5))) * 1.1) if detail_keywords else 0.4
+        if matched_detail_kw:
+            reasons.append(f"Role/focus match: {', '.join(matched_detail_kw[:5])}")
+
+        heuristic_score = (0.45 * skill_score) + (0.30 * project_score) + (0.25 * role_score)
+
+        # 4. Optional LLM Semantic Evaluation (Resume Details + Projects + Job Details)
+        llm_cfg = build_llm_config(user_settings)
+        final_score = heuristic_score
+        if is_llm_configured(
+            api_key=llm_cfg.get("api_key"),
+            provider=llm_cfg.get("provider"),
+            custom_api_base=llm_cfg.get("custom_api_base"),
+        ):
+            try:
+                candidate_payload: Dict[str, Any] = {
+                    "summary": profile.summary or "",
+                    "skills": profile.skills or [],
+                    "projects": profile.projects or [],
+                    "experience": profile.experience or [],
+                    "education": profile.education or [],
+                    "target_roles": user_settings.target_roles or [],
+                    "job_details": user_settings.job_details or "",
+                }
+                prompt = f"""
+Evaluate how well this candidate matches the job using their resume details, projects, and desired job focus.
+Job Title: {job.title}
+Company: {job.company}
+Job Description: {(job.description or '')[:2500]}
+
+Candidate Profile & Projects:
+{json.dumps(candidate_payload, indent=2)[:3500]}
+
+Return ONLY raw JSON:
+{{"score": 0.85, "reason": "One short sentence explaining alignment with candidate projects and skills."}}
+"""
+                llm_res = call_llm_json(
+                    system_prompt="You are a technical recruiter AI. Output ONLY valid raw JSON.",
+                    user_prompt=prompt,
+                    llm_config=llm_cfg,
+                    timeout=20.0,
+                )
+                sem_score = max(0.0, min(1.0, float(llm_res.get("score", heuristic_score))))
+                if llm_res.get("reason"):
+                    reasons.insert(0, str(llm_res["reason"]).strip())
+                final_score = (0.65 * sem_score) + (0.35 * heuristic_score)
+            except Exception as exc:
+                logger.warning(f"LLM matching fallback for job {job_id}: {exc}")
+
+        final_score = round(max(0.05, min(0.99, final_score)), 3)
+        score_pct = int(round(final_score * 100))
+        is_match = final_score >= settings.MATCHING_THRESHOLD
+
+        if not reasons:
+            reasons.append(f"Profile relevance score: {score_pct}%")
 
         return {
-            "is_match": is_above_threshold,
-            "score": round(composite_score, 3),
-            "reasons": reasons
+            "is_match": is_match,
+            "score": final_score,
+            "score_pct": score_pct,
+            "reasons": reasons,
         }

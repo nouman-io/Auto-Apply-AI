@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AutoApplyAI - RAG Resume & Direct Gmail Auto-Apply Agent",
-  description: "Automated agentic suite that matches, applies, and schedules responses for your applications lifecycle",
+  title: "AutoApplyAI - Resume Matching, Playwright & Gmail Auto-Apply",
+  description: "Real-time job discovery (LinkedIn, Indeed, Google, Greenhouse), resume & project matching, Playwright form-filling, and Gmail auto-apply.",
   icons: {
     icon: "/logo.png",
     shortcut: "/logo.png",

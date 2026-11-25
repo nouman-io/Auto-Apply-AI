@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "API Settings & Integrations | AutoApply AI",
-  description: "Configure your LLM providers (OpenAI/Ollama), Google OAuth client secrets, and global job board API keys.",
+  title: "API & Sources Settings | AutoApply AI",
+  description: "Configure AI model providers, Gmail credentials, and LinkedIn, Indeed, Google, and Greenhouse connectors.",
 };
 
 export default function SettingsLayout({

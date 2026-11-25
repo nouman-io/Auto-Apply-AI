@@ -9,7 +9,7 @@ import bcrypt
 from typing import Optional
 
 from src.app.db.database import get_db
-from src.app.db.models import User, Profile, UserSettings
+from src.app.db.models import User
 from src.app.core.config import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])

@@ -3,8 +3,7 @@
 import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/app/context/AuthContext';
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+import { API_BASE, parseApiError } from '@/app/lib/api';
 
 export default function Register() {
   const [email, setEmail] = useState('');
@@ -18,14 +17,14 @@ export default function Register() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    
+
     if (password !== confirmPassword) {
       setError('Passwords do not match');
       return;
     }
 
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters long');
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters long');
       return;
     }
 
@@ -34,21 +33,18 @@ export default function Register() {
     try {
       const response = await fetch(`${API_BASE}/api/v1/auth/register`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Registration failed');
+        throw new Error(await parseApiError(response, 'Registration failed'));
       }
 
       const data = await response.json();
       login(data.access_token, data.user);
-    } catch (err: any) {
-      setError(err.message || 'Registration failed. Please try again.');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Registration failed. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -61,7 +57,7 @@ export default function Register() {
         <div className="relative z-10">
           <img src="/logo.png" alt="Auto-Apply AI Logo" className="w-16 h-16 mx-auto mb-4 object-contain rounded-xl shadow-[0_0_20px_rgba(244,63,94,0.4)]" />
           <h2 className="text-2xl font-extrabold text-white tracking-tight mb-1">Create Your Workspace</h2>
-          <p className="text-slate-400 text-xs mb-6">Set up your account to start automating job searches, matching, and Gmail dispatching.</p>
+          <p className="text-slate-400 text-xs mb-6">Set up your account to start automating job searches, matching, and Playwright/Gmail applications.</p>
 
           <form onSubmit={handleSubmit} className="space-y-4 text-left">
             {error && (
@@ -90,7 +86,7 @@ export default function Register() {
 
             <div>
               <label htmlFor="password" className="block text-xs font-bold text-slate-300 uppercase tracking-wider mb-1.5">
-                Password
+                Password (min 8 characters)
               </label>
               <input
                 id="password"

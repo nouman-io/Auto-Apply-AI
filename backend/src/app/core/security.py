@@ -1,139 +1,25 @@
-import logging
-import jwt
-import base64
-import hashlib
-from cryptography.fernet import Fernet
-from fastapi import HTTPException, Security, status, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends
 from sqlalchemy.orm import Session
-from src.app.core.config import settings
 from src.app.db.database import get_db
-from src.app.db.models import User, UserRole
+from src.app.db.models import User
 
-logger = logging.getLogger(__name__)
+DEFAULT_WORKSPACE_USER_ID = "workspace-default"
+DEFAULT_WORKSPACE_EMAIL = "workspace@autoapply.local"
 
-security_scheme = HTTPBearer(auto_error=False)
 
-SECRET_KEY = settings.SECRET_KEY
-ALGORITHM = "HS256"
-
-def get_fernet() -> Fernet:
-    """Generate a stable Fernet key derived from the application SECRET_KEY."""
-    if not SECRET_KEY:
-        raise ValueError("SECRET_KEY environment variable is not set")
-    # Derive a 32-byte url-safe base64 key from the secret key
-    key = hashlib.sha256(SECRET_KEY.encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(key))
-
-def encrypt_credential(credential: str) -> str:
-    """Encrypt a sensitive string."""
-    if not credential:
-        return credential
-    f = get_fernet()
-    return f.encrypt(credential.encode()).decode()
-
-def decrypt_credential(encrypted_credential: str) -> str:
-    """Decrypt a sensitive string."""
-    if not encrypted_credential:
-        return encrypted_credential
-    f = get_fernet()
-    try:
-        return f.decrypt(encrypted_credential.encode()).decode()
-    except Exception as e:
-        logger.error(f"Failed to decrypt credential: {e}")
-        return None
-
-async def get_current_user(
-    token_creds: HTTPAuthorizationCredentials = Security(security_scheme),
-    db: Session = Depends(get_db)
-):
-    """
-    FastAPI dependency to extract and verify the JWT token and return full user object.
-    """
-    if not token_creds:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authentication credentials.",
-        )
-    
-    token = token_creds.credentials
-
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        uid = payload.get("uid")
-        email = payload.get("sub")
-        
-        if not uid:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token payload",
-            )
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
-        )
-    except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-        )
-    
-    # Fetch user from database
-    user = db.query(User).filter(User.id == uid).first()
+async def get_current_user(db: Session = Depends(get_db)) -> User:
+    """Resolve the active local workspace user without requiring authentication."""
+    user = db.query(User).filter(User.id == DEFAULT_WORKSPACE_USER_ID).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
+        user = db.query(User).first()
+    if not user:
+        user = User(
+            id=DEFAULT_WORKSPACE_USER_ID,
+            email=DEFAULT_WORKSPACE_EMAIL,
+            is_active=True,
+            is_verified=True,
         )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is inactive",
-        )
-    
+        db.add(user)
+        db.commit()
+        db.refresh(user)
     return user
-
-
-async def get_current_admin_user(current_user: User = Depends(get_current_user)):
-    """
-    Dependency to ensure current user has admin or super_admin role.
-    """
-    if current_user.role not in [UserRole.ADMIN, UserRole.SUPER_ADMIN]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required",
-        )
-    return current_user
-
-
-async def get_current_super_admin_user(current_user: User = Depends(get_current_user)):
-    """
-    Dependency to ensure current user has super_admin role.
-    """
-    if current_user.role != UserRole.SUPER_ADMIN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Super admin access required",
-        )
-    return current_user
-
-
-def require_role(required_role: UserRole):
-    """
-    Factory function to create a dependency that requires a specific role.
-    
-    Usage:
-        @router.get("/admin-only")
-        async def admin_endpoint(user: User = Depends(require_role(UserRole.ADMIN))):
-            ...
-    """
-    async def role_checker(current_user: User = Depends(get_current_user)):
-        if current_user.role != required_role and current_user.role != UserRole.SUPER_ADMIN:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Role '{required_role.value}' required",
-            )
-        return current_user
-    return role_checker

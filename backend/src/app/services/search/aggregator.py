@@ -1,233 +1,311 @@
-import re
 import asyncio
 import logging
+import re
+from typing import List, Dict, Any, Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from src.app.db.models import JobFound
-from src.app.services.search.adzuna import AdzunaProvider
-from src.app.services.search.jooble import JoobleProvider
-from src.app.services.search.boards import GreenhouseProvider, LeverProvider
-from src.app.services.search.rss import RSSProvider
+
+from src.app.db.models import JobFound, Profile, UserSettings, UserJobMatch
+from src.app.services.email_extractor import extract_emails_from_text, select_best_hiring_email
+from src.app.services.matching.matcher import MatchingEngine
+from src.app.services.search.linkedin import LinkedInProvider
+from src.app.services.search.indeed import IndeedProvider
+from src.app.services.search.google import GoogleJobsProvider
+from src.app.services.search.greenhouse import GreenhouseProvider
 
 logger = logging.getLogger(__name__)
 
-class SearchAggregator:
-    def __init__(self):
-        self.providers = [
-            AdzunaProvider(),
-            JoobleProvider(),
-            GreenhouseProvider(),
-            LeverProvider(),
-            RSSProvider()
-        ]
+COUNTRY_MAP = {
+    "united states": "us", "canada": "ca", "united kingdom": "gb",
+    "germany": "de", "netherlands": "nl", "switzerland": "ch",
+    "sweden": "se", "australia": "au", "singapore": "sg",
+    "united arab emirates": "ae", "saudi arabia": "sa", "japan": "jp",
+    "ireland": "ie", "france": "fr", "new zealand": "nz",
+    "denmark": "dk", "norway": "no", "finland": "fi",
+    "india": "in", "pakistan": "pk", "poland": "pl",
+}
 
-    async def run_aggregation(self, db: Session, query: str, country: str = "us", user_id: str = None):
-        """
-        Runs all active search providers, aggregates findings, filters duplicates,
-        and saves unique records into the database.
-        """
-        logger.info(f"Starting Search Aggregator pipeline for query: '{query}' in country: '{country}'")
-        
-        # Retrieve user-configured API keys and credentials from UserSettings database
-        jooble_key = None
-        adzuna_id = None
-        adzuna_key = None
+
+def _extract_country_codes(preferred_countries: Optional[List[str]]) -> List[str]:
+    if not preferred_countries:
+        return ["us"]
+    emoji_pattern = re.compile(r"[\U0001F1E6-\U0001F1FF]")
+    codes: List[str] = []
+    for raw in preferred_countries:
+        cleaned = emoji_pattern.sub("", str(raw).lower()).strip()
+        matched = False
+        for name_key, code in COUNTRY_MAP.items():
+            if name_key in cleaned or cleaned == code:
+                codes.append(code)
+                matched = True
+                break
+        if not matched and len(cleaned) == 2 and cleaned.isalpha():
+            codes.append(cleaned)
+    return list(dict.fromkeys(codes)) or ["us"]
+
+
+def build_resume_guided_queries(
+    profile: Optional[Profile],
+    user_settings: Optional[UserSettings],
+    explicit_query: Optional[str] = None,
+) -> List[str]:
+    """
+    Build search queries from:
+    1. Explicit user query / job_details ("what type of work they do")
+    2. Target roles
+    3. Resume skills & projects
+    """
+    if explicit_query and explicit_query.strip():
+        return [explicit_query.strip()]
+
+    queries: List[str] = []
+    target_roles = (user_settings.target_roles if user_settings and user_settings.target_roles else []) or []
+    job_details = (user_settings.job_details if user_settings else "") or ""
+    skills = (profile.skills if profile and profile.skills else []) or []
+    projects = (profile.projects if profile and profile.projects else []) or []
+
+    # Extract concise tech stack from projects
+    project_terms: List[str] = []
+    for proj in projects[:4]:
+        if isinstance(proj, dict):
+            for t in proj.get("technologies") or []:
+                if isinstance(t, str) and t.strip():
+                    project_terms.append(t.strip())
+            if proj.get("name"):
+                words = [w for w in re.findall(r"[a-zA-Z0-9+#.]{3,}", proj["name"]) if w.lower() not in ("app", "system", "project", "platform")]
+                project_terms.extend(words[:2])
+
+    # Extract concise focus terms from job_details
+    detail_terms = [
+        w for w in re.findall(r"[a-zA-Z0-9+#.]{3,}", job_details)
+        if w.lower() not in ("want", "work", "jobs", "looking", "with", "that", "this", "have", "type")
+    ]
+
+    top_skills = skills[:2]
+    top_proj = list(dict.fromkeys(project_terms))[:2]
+
+    for role in target_roles[:2]:
+        if role and role.strip():
+            queries.append(role.strip())
+            if top_skills:
+                queries.append(f"{role.strip()} {top_skills[0]}".strip())
+
+    if detail_terms:
+        queries.append(" ".join(detail_terms[:3]))
+
+    if top_proj:
+        base_role = target_roles[0] if target_roles else (top_skills[0] if top_skills else "Software Engineer")
+        queries.append(f"{base_role} {top_proj[0]}".strip())
+
+    if not queries:
+        if top_skills:
+            queries.append(f"{' '.join(top_skills[:2])} Developer")
+        else:
+            queries.append("Software Engineer")
+
+    return list(dict.fromkeys(q for q in queries if q))[:4]
+
+
+class SearchAggregator:
+    """Connects to LinkedIn, Indeed, Google, and Greenhouse to gather and score jobs."""
+
+    def __init__(self):
+        self.linkedin = LinkedInProvider()
+        self.indeed = IndeedProvider()
+        self.google = GoogleJobsProvider()
+        self.greenhouse = GreenhouseProvider()
+
+    async def run_aggregation(
+        self,
+        db: Session,
+        query: str,
+        country: str = "us",
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run LinkedIn, Indeed, Google, and Greenhouse concurrently and persist new jobs."""
+        logger.info(f"Running 4-source aggregation (LinkedIn, Indeed, Google, Greenhouse) for '{query}' [{country}]")
+
+        greenhouse_companies = None
+        serpapi_key = None
+        enabled = {"linkedin", "indeed", "google", "greenhouse"}
         if user_id and db:
-            from src.app.db.models import UserSettings
             u_set = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
             if u_set:
-                jooble_key = u_set.jooble_api_key
-                adzuna_id = u_set.adzuna_app_id
-                adzuna_key = u_set.adzuna_app_key
+                if u_set.greenhouse_companies:
+                    greenhouse_companies = u_set.greenhouse_companies
+                serpapi_key = u_set.serpapi_api_key
+                if u_set.enabled_connectors is not None:
+                    enabled = {c.lower() for c in u_set.enabled_connectors}
 
-        # Run all providers concurrently
-        tasks = [
-            AdzunaProvider().search(query, country, app_id=adzuna_id, app_key=adzuna_key),
-            JoobleProvider().search(query, country, api_key=jooble_key),
-            GreenhouseProvider().search(query, country),
-            LeverProvider().search(query, country),
-            RSSProvider().search(query, country)
+        provider_specs = [
+            ("linkedin", self.linkedin, self.linkedin.search(query, country=country)),
+            ("indeed", self.indeed, self.indeed.search(query, country=country)),
+            ("google", self.google, self.google.search(query, country=country, serpapi_key=serpapi_key)),
+            ("greenhouse", self.greenhouse, self.greenhouse.search(query, country=country, companies=greenhouse_companies)),
         ]
-        
-        gathered_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        all_opportunities = []
-        for res in gathered_results:
+        active = [(p, coro) for key, p, coro in provider_specs if key in enabled]
+        for key, p, coro in provider_specs:
+            if key not in enabled:
+                coro.close()
+
+        providers = [p for p, _ in active]
+        tasks = [coro for _, coro in active]
+
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_opportunities: List[Dict[str, Any]] = []
+        source_status: Dict[str, Dict[str, Any]] = {}
+        for provider, res in zip(providers, gathered):
             if isinstance(res, Exception):
-                logger.error(f"Search provider raised an exception: {res}", exc_info=True)
-            elif isinstance(res, list):
+                logger.error(f"Provider {provider.source_name} failed: {res}")
+                source_status[provider.source_name] = {
+                    "source": provider.source_name,
+                    "status": "error",
+                    "count": 0,
+                    "detail": str(res),
+                }
+            else:
                 all_opportunities.extend(res)
+                source_status[provider.source_name] = dict(provider.last_status)
 
-        logger.info(f"Aggregated {len(all_opportunities)} raw opportunities from all providers.")
-
-        # Deduplicate and save to database
         new_records_count = 0
+        touched_job_ids: List[int] = []
         seen_urls = set()
 
         for opp in all_opportunities:
-            url = opp.get("url")
-            if not url:
-                continue
-            
-            # Skip duplicates within the current batch
-            if url in seen_urls:
+            url = (opp.get("url") or "").strip()
+            if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
 
-            # Check if opportunity already exists in database
-            exists = db.query(JobFound).filter(JobFound.url == url).first()
-            if not exists:
-                description = opp.get("description", "")
-                company = opp.get("company", "Company")
-                
-                # Extract hiring emails from description
-                from src.app.services.email_extractor import extract_emails_from_text, select_best_hiring_email
-                extracted_emails = extract_emails_from_text(description)
-                company_email = select_best_hiring_email(extracted_emails, company)
-                
-                # Enhanced email fallback - use more authentic HR email patterns
-                if not company_email and company and len(company) > 1:
-                    clean_comp = re.sub(r'[^a-zA-Z0-9]', '', company.lower())
-                    if clean_comp:
-                        # Try common HR email patterns in order of preference
-                        hr_email_patterns = [
-                            f"hr@{clean_comp}.com",
-                            f"recruiting@{clean_comp}.com",
-                            f"jobs@{clean_comp}.com",
-                            f"careers@{clean_comp}.com",
-                            f"talent@{clean_comp}.com"
-                        ]
-                        company_email = hr_email_patterns[1]  # Use recruiting@ as most authentic
+            existing = db.query(JobFound).filter(JobFound.url == url).first()
+            if existing:
+                touched_job_ids.append(existing.id)
+                continue
 
-                # Enhance description with structured job information
-                enhanced_description = description
-                if enhanced_description:
-                    # Build enhanced description with metadata
-                    parts = []
-                    if company:
-                        parts.append(f"🏢 Company: {company}")
-                    if opp.get("location"):
-                        parts.append(f"📍 Location: {opp['location']}")
-                    if opp.get("country") or country:
-                        parts.append(f"🌍 Country: {(opp.get('country') or country).upper()}")
-                    if opp.get("salary") and opp["salary"] != "N/A":
-                        parts.append(f"💰 Salary: {opp['salary']}")
-                    
-                    # Add separator and original description
-                    if parts:
-                        parts.append("\n" + "="*50)
-                        parts.append("\n📋 Job Description:\n")
-                        parts.append(enhanced_description)
-                        enhanced_description = "\n".join(parts)
-                
-                # Save new job found record
-                job_record = JobFound(
-                    title=opp.get("title") or "Untitled Opportunity",
-                    company=company or "Unknown Company",
-                    company_email=company_email,
-                    extracted_emails=extracted_emails,
-                    location=opp.get("location"),
-                    country=opp.get("country") or country,
-                    description=enhanced_description,
-                    url=url,
-                    salary=opp.get("salary"),
-                    source=opp.get("source", "Aggregator"),
-                    opportunity_type=opp.get("opportunity_type", "job"),
-                    raw_data=opp.get("raw_data", {})
-                )
-                db.add(job_record)
-                # Commit per-record so a single duplicate/constraint failure
-                # never aborts the whole aggregation batch.
-                try:
-                    db.commit()
-                    new_records_count += 1
-                except IntegrityError:
-                    db.rollback()
-                    logger.warning(f"Skipped duplicate job insertion for URL: {url}")
-                except Exception as exc:
-                    db.rollback()
-                    logger.error(f"Failed to insert job {url}: {exc}")
+            description = opp.get("description") or ""
+            company = opp.get("company") or "Company"
 
-        logger.info(f"Aggregator pipeline complete. Saved {new_records_count} new opportunities to the database.")
-        return new_records_count
+            # Extract ONLY genuine HR emails found in posting content (never fabricate)
+            extracted_emails = extract_emails_from_text(description)
+            company_email = select_best_hiring_email(extracted_emails, company)
+            apply_method = "email" if company_email else "playwright"
 
-    async def run_preferences_guided_search(self, db: Session, user_id: str):
+            job_record = JobFound(
+                title=opp.get("title") or "Untitled Role",
+                company=company,
+                company_email=company_email,
+                extracted_emails=extracted_emails,
+                location=opp.get("location"),
+                country=(opp.get("country") or country).lower(),
+                description=description,
+                url=url,
+                apply_url=opp.get("apply_url") or url,
+                apply_method=apply_method,
+                salary=opp.get("salary"),
+                source=opp.get("source") or "Greenhouse",
+                opportunity_type=opp.get("opportunity_type") or "job",
+                raw_data=opp.get("raw_data") or {},
+            )
+            db.add(job_record)
+            try:
+                db.commit()
+                db.refresh(job_record)
+                new_records_count += 1
+                touched_job_ids.append(job_record.id)
+            except IntegrityError:
+                db.rollback()
+            except Exception as exc:
+                db.rollback()
+                logger.error(f"Failed to insert job {url}: {exc}")
+
+        return {
+            "new_count": new_records_count,
+            "job_ids": touched_job_ids,
+            "source_status": source_status,
+        }
+
+    async def run_preferences_guided_search(
+        self,
+        db: Session,
+        user_id: str,
+        explicit_query: Optional[str] = None,
+        explicit_country: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Preferences-Guided Job Search Agent:
-        1. Reads user preferences (target countries, target roles, employment types).
-        2. Reads candidate resume profile skills & keywords from Profile model.
-        3. Formulates optimized search queries blending resume skills + user target preferences.
-        4. Runs search aggregator across preferred countries and evaluates match scores.
+        Full whiteboard pipeline:
+        1. Read extracted Resume details & projects + user job_details & target preferences.
+        2. Query LinkedIn, Indeed, Google, and Greenhouse.
+        3. Score every discovered job against the user's Resume & projects and persist scores.
         """
-        from src.app.db.models import Profile, UserSettings
-        from src.app.services.matching.matcher import MatchingEngine
-        
         profile = db.query(Profile).filter(Profile.user_id == user_id).first()
         user_settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
 
-        # Extract target countries or default to US/GB/DE/CA/AE
-        target_countries = ["us", "ca", "gb", "de", "ae"]
-        if user_settings and user_settings.preferred_countries:
-            # Strip emoji flags from country names before matching (e.g. "United States 🇺🇸" -> "United States")
-            import re as _re
-            emoji_pattern = _re.compile(
-                "[\U0001F1E6-\U0001F1FF]"
-            )
-            country_map = {
-                "united states": "us", "canada": "ca", "united kingdom": "gb", 
-                "germany": "de", "netherlands": "nl", "switzerland": "ch", 
-                "sweden": "se", "australia": "au", "singapore": "sg", 
-                "united arab emirates": "ae", "saudi arabia": "sa", "japan": "jp",
-                "ireland": "ie", "france": "fr", "new zealand": "nz", 
-                "denmark": "dk", "norway": "no", "finland": "fi",
-                "austria": "at", "belgium": "be", "spain": "es",
-                "italy": "it", "portugal": "pt", "poland": "pl",
-                "estonia": "ee", "qatar": "qa", "kuwait": "kw",
-                "oman": "om", "bahrain": "bh", "turkey": "tr",
-                "south korea": "kr", "malaysia": "my", "china": "cn",
-                "india": "in", "pakistan": "pk", "brazil": "br",
-                "mexico": "mx", "argentina": "ar", "chile": "cl",
-                "south africa": "za"
-            }
-            extracted_codes = []
-            for country_str in user_settings.preferred_countries:
-                # Remove emoji flags and normalize
-                c_clean = emoji_pattern.sub("", country_str.lower()).strip()
-                for name_key, code in country_map.items():
-                    if name_key in c_clean or code in c_clean:
-                        extracted_codes.append(code)
-                        break
-                else:
-                    # Try direct code match (e.g. "us", "gb")
-                    if len(c_clean) == 2 and c_clean.isalpha():
-                        extracted_codes.append(c_clean)
-            if extracted_codes:
-                target_countries = list(set(extracted_codes))
+        queries = build_resume_guided_queries(profile, user_settings, explicit_query=explicit_query)
+        if explicit_country:
+            countries = [explicit_country.lower()]
+        else:
+            countries = _extract_country_codes(user_settings.preferred_countries if user_settings else None)
 
-        # Extract resume skills & target roles
-        resume_skills = (profile.skills if profile and profile.skills else ["Python", "FastAPI", "React", "Next.js"])
-        target_roles = (user_settings.target_roles if user_settings and user_settings.target_roles else ["Full Stack Developer", "AI Engineer"])
+        total_new = 0
+        merged_sources: Dict[str, Dict[str, Any]] = {}
+        candidate_job_ids: List[int] = []
 
-        # Formulate search queries
-        search_queries = []
-        for role in target_roles[:2]:
-            top_skills = " ".join(resume_skills[:2]) if resume_skills else ""
-            search_queries.append(f"{role} {top_skills}".strip())
+        for country in countries[:2]:
+            for query in queries[:3]:
+                agg = await self.run_aggregation(db=db, query=query, country=country, user_id=user_id)
+                total_new += agg["new_count"]
+                candidate_job_ids.extend(agg["job_ids"])
+                for src, info in agg["source_status"].items():
+                    prev = merged_sources.get(src)
+                    if not prev:
+                        merged_sources[src] = dict(info)
+                    else:
+                        prev["count"] = prev.get("count", 0) + info.get("count", 0)
+                        if info.get("status") == "ok":
+                            prev["status"] = "ok"
+                            prev["detail"] = f"Collected {prev['count']} results from {src}."
 
-        if profile and profile.employment_types and any("internship" in et.lower() for et in profile.employment_types):
-            search_queries.append(f"{target_roles[0] if target_roles else 'Developer'} Internship")
-
-        total_new_opportunities = 0
-        for country in target_countries[:3]:
-            for query in search_queries:
-                count = await self.run_aggregation(db=db, query=query, country=country, user_id=user_id)
-                total_new_opportunities += count
-
-        # Run Matcher evaluation for unrated jobs
+        # Score all jobs (new + recent) for this user so the portal ranks according to resume
         matcher = MatchingEngine()
-        unrated_jobs = db.query(JobFound).all()
-        for job in unrated_jobs:
-            eval_res = await matcher.evaluate_job_match(db=db, user_id=user_id, job_id=job.id)
-            logger.info(f"Evaluated Job {job.id} ({job.title}): Score={eval_res.get('score')} Match={eval_res.get('is_match')}")
+        jobs_to_score = db.query(JobFound).order_by(JobFound.found_at.desc()).limit(100).all()
+        scored_count = 0
 
-        return total_new_opportunities
+        for job in jobs_to_score:
+            eval_res = await matcher.evaluate_job_match(db=db, user_id=user_id, job_id=job.id)
+            score_pct = eval_res["score_pct"]
+            reasons = eval_res["reasons"]
+
+            existing_match = (
+                db.query(UserJobMatch)
+                .filter(UserJobMatch.user_id == user_id, UserJobMatch.job_id == job.id)
+                .first()
+            )
+            if existing_match:
+                existing_match.match_score = score_pct
+                existing_match.match_reasons = reasons
+            else:
+                db.add(UserJobMatch(
+                    user_id=user_id,
+                    job_id=job.id,
+                    match_score=score_pct,
+                    match_reasons=reasons,
+                ))
+
+            job.match_score = score_pct
+            job.match_reasons = reasons
+            scored_count += 1
+
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.error(f"Failed to persist job match scores: {exc}")
+
+        return {
+            "new_opportunities_found": total_new,
+            "total_scored": scored_count,
+            "queries_used": queries,
+            "countries_used": countries[:2],
+            "source_status": merged_sources,
+        }

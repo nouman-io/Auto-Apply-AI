@@ -1,6 +1,3 @@
-# Configuration loader
-import logging
-import os
 import json
 import warnings
 from typing import Optional, Annotated, Union
@@ -8,18 +5,10 @@ from typing import Optional, Annotated, Union
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 
-logger = logging.getLogger(__name__)
-
 
 def _normalize_str_list(value):
     """
     Coerce a raw env value (or already-decoded list/tuple) into a clean list of strings.
-
-    Accepts:
-      - JSON arrays:   '["http://a.com", "http://b.com"]'
-      - Comma separated: 'http://a.com,http://b.com'
-      - Single value:    'http://a.com'
-      - Python list/tuple (e.g. via constructor)
     """
     if value is None:
         return []
@@ -49,64 +38,58 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "uploads"
     MAX_UPLOAD_SIZE_MB: int = 10
 
-    # CORS & hosts - NoDecode lets us accept plain comma-separated strings
-    # from .env AND JSON arrays without crashing the app at startup.
+    # CORS & hosts
     CORS_ORIGINS: Annotated[list[str], NoDecode] = ["http://localhost:3000"]
-    ALLOWED_HOSTS: Annotated[list[str], NoDecode] = ["*"]  # lock down per deployment in prod
+    ALLOWED_HOSTS: Annotated[list[str], NoDecode] = ["*"]
+
     # Database Configurations
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
     POSTGRES_DB: str = "auto_apply_db"
     POSTGRES_PORT: str = "5432"
-    
+
     # Redis Configurations
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
-    
 
-    # Firebase Setup
-    FIREBASE_PROJECT_ID: Optional[str] = None
-    FIREBASE_STORAGE_BUCKET: Optional[str] = None
-    
-    # OpenAI Configurations
+    # LLM Configurations
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
-    
-    # Gemini Configurations
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_MODEL: str = "gemini-1.5-flash"
-    
-    # Search Agent Configurations
-    ADZUNA_APP_ID: Optional[str] = None
-    ADZUNA_APP_KEY: Optional[str] = None
-    JOOBLE_API_KEY: Optional[str] = None
-    TRACKED_COMPANIES_GREENHOUSE: Annotated[list[str], NoDecode] = ["vercel", "openai", "cloudflare"]
-    TRACKED_COMPANIES_LEVER: Annotated[list[str], NoDecode] = ["figma", "vercel", "openai"]
+
+    # Search Connectors (LinkedIn, Indeed, Google, Greenhouse)
+    TRACKED_COMPANIES_GREENHOUSE: Annotated[list[str], NoDecode] = [
+        "vercel", "openai", "cloudflare", "anthropic", "stripe", "figma",
+        "databricks", "linear", "scaleai", "gitlab", "canonical", "airtable"
+    ]
+    SERPAPI_API_KEY: Optional[str] = None
+    GOOGLE_SEARCH_API_KEY: Optional[str] = None
+    GOOGLE_SEARCH_CX: Optional[str] = None
+
     SEARCH_INTERVAL_HOURS: int = 6
-    MATCHING_THRESHOLD: float = 0.8
+    MATCHING_THRESHOLD: float = 0.55
+    DAILY_APPLY_MAX: int = 15
+
+    # Playwright & Apply Runner Configurations
     PLAYWRIGHT_HEADLESS: bool = True
     PLAYWRIGHT_TIMEOUT: int = 30000
-    
+    EMAIL_APPLY_MIN_DELAY_SECONDS: int = 30
+    EMAIL_APPLY_MAX_DELAY_SECONDS: int = 60
+    PLAYWRIGHT_APPLY_MIN_DELAY_SECONDS: int = 3
+    PLAYWRIGHT_APPLY_MAX_DELAY_SECONDS: int = 8
+
     # Email & Gmail OAuth Configurations
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/gmail/callback"
-    EMAIL_IMAP_SERVER: Optional[str] = None
     EMAIL_SMTP_SERVER: str = "smtp.gmail.com"
     EMAIL_SMTP_PORT: int = 587
-    EMAIL_ADDRESS: Optional[str] = None
-    EMAIL_PASSWORD: Optional[str] = None
-    EMAIL_CHECK_INTERVAL_MINUTES: int = 15
-    
-    # Notification Agent Configurations
-    DISCORD_WEBHOOK_URL: Optional[str] = None
-    TELEGRAM_BOT_TOKEN: Optional[str] = None
-    TELEGRAM_CHAT_ID: Optional[str] = None
-    
+
     # Security Setup
     SECRET_KEY: str = "supersecretdevelopmentkeychangeinprod"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -115,7 +98,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("CORS_ORIGINS", "ALLOWED_HOSTS", "TRACKED_COMPANIES_GREENHOUSE", "TRACKED_COMPANIES_LEVER", mode="before")
+    @field_validator("CORS_ORIGINS", "ALLOWED_HOSTS", "TRACKED_COMPANIES_GREENHOUSE", mode="before")
     @classmethod
     def _coerce_list_fields(cls, v: Union[str, list, tuple, None]):
         return _normalize_str_list(v)
@@ -129,8 +112,7 @@ class Settings(BaseSettings):
         ):
             warnings.warn(
                 "SECRET_KEY is still set to a known insecure development default. "
-                "Generate a strong random key (e.g. `python -c \"import secrets; print(secrets.token_hex(32))\"`) "
-                "and set it in your .env before deploying.",
+                "Generate a strong random key and set it in your .env before deploying.",
                 stacklevel=2,
             )
         if len(v) < 32:
