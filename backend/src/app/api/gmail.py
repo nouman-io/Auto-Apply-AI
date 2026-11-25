@@ -97,10 +97,10 @@ def gmail_oauth_callback(
             logger.warning(f"Error fetching Gmail userinfo: {e}")
         
         db.commit()
-        return RedirectResponse(url=f"{settings.FRONTEND_BASE_URL}?gmail_connected=true")
+        return RedirectResponse(url=f"{settings.FRONTEND_BASE_URL}/plugins?gmail_connected=true")
     else:
         error_msg = tokens.get("error", "OAuth failed")
-        return RedirectResponse(url=f"{settings.FRONTEND_BASE_URL}?gmail_error={error_msg}")
+        return RedirectResponse(url=f"{settings.FRONTEND_BASE_URL}/plugins?gmail_error={error_msg}")
 
 @router.post("/setup-smtp")
 def setup_gmail_smtp(

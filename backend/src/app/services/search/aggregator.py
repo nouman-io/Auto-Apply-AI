@@ -137,19 +137,23 @@ class SearchAggregator:
                 if u_set.enabled_connectors is not None:
                     enabled = {c.lower() for c in u_set.enabled_connectors}
 
-        provider_specs = [
-            ("linkedin", self.linkedin, self.linkedin.search(query, country=country)),
-            ("indeed", self.indeed, self.indeed.search(query, country=country)),
-            ("google", self.google, self.google.search(query, country=country, serpapi_key=serpapi_key)),
-            ("greenhouse", self.greenhouse, self.greenhouse.search(query, country=country, companies=greenhouse_companies)),
-        ]
-        active = [(p, coro) for key, p, coro in provider_specs if key in enabled]
-        for key, p, coro in provider_specs:
-            if key not in enabled:
-                coro.close()
+        providers = []
+        tasks = []
+        if "linkedin" in enabled:
+            providers.append(self.linkedin)
+            tasks.append(self.linkedin.search(query, country=country))
+        if "indeed" in enabled:
+            providers.append(self.indeed)
+            tasks.append(self.indeed.search(query, country=country))
+        if "google" in enabled:
+            providers.append(self.google)
+            tasks.append(self.google.search(query, country=country, serpapi_key=serpapi_key))
+        if "greenhouse" in enabled:
+            providers.append(self.greenhouse)
+            tasks.append(self.greenhouse.search(query, country=country, companies=greenhouse_companies))
 
-        providers = [p for p, _ in active]
-        tasks = [coro for _, coro in active]
+        if not tasks:
+            return {"new_count": 0, "job_ids": [], "source_status": {}}
 
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
 

@@ -1,122 +1,77 @@
 @import "tailwindcss";
 
 :root {
-  --background: #090a0f;
-  --foreground: #f3f4f6;
+  --bg: #090a0d;
+  --sidebar: #0e1015;
+  --surface: #12141b;
+  --surface-2: #171a23;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --text: #f4f4f5;
+  --muted: #a1a1aa;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-/* Sharp, High-Contrast Grid Background on Full Screen */
 body {
-  background-color: #090a0f !important;
-  color: var(--foreground);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
   min-height: 100vh;
-  overflow-x: clip;
-  background-size: 32px 32px !important;
-  background-image: 
-    linear-gradient(to right, rgba(255, 255, 255, 0.15) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.15) 1px, transparent 1px) !important;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Bright Visible Grid Pattern Class */
-.bg-grid-omni {
-  background-size: 32px 32px !important;
-  background-image: 
-    linear-gradient(to right, rgba(255, 255, 255, 0.15) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.15) 1px, transparent 1px) !important;
+.panel {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
 }
 
-/* Red Glow Top Backdrop (OmniRoute screenshot) */
-.bg-coral-glow {
-  background: radial-gradient(circle at 50% -10%, rgba(244, 63, 94, 0.22) 0%, rgba(225, 29, 72, 0.08) 40%, transparent 75%) !important;
+.panel-elevated {
+  background-color: var(--surface-2);
+  border: 1px solid var(--border);
 }
 
-/* Glowing Red Primary Button (Exact match to 'Start Free' in screenshot) */
-.btn-red-glow {
-  background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%) !important;
-  box-shadow: 0 0 25px rgba(244, 63, 94, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.3) !important;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+.field {
+  background-color: #0b0d12;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.btn-red-glow:hover {
-  background: linear-gradient(135deg, #fb7185 0%, #f43f5e 100%) !important;
-  box-shadow: 0 0 35px rgba(244, 63, 94, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.4) !important;
-  transform: translateY(-1px) !important;
+.field:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.35);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
 }
 
-/* Secondary dark button (like GitHub button in screenshot) */
-.btn-dark-outline {
-  background: rgba(15, 17, 23, 0.85) !important;
-  border: 1px solid rgba(255, 255, 255, 0.2) !important;
-  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4) !important;
-  transition: all 0.2s ease !important;
+.kbd {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #a1a1aa;
 }
 
-.btn-dark-outline:hover {
-  background: rgba(255, 255, 255, 0.1) !important;
-  border-color: rgba(255, 255, 255, 0.4) !important;
-  transform: translateY(-1px) !important;
-}
-
-/* Dark Terminal Code Box (Matching right box in screenshot) */
-.dark-terminal-box {
-  background: #10121a !important;
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
-  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.85) !important;
-}
-
-/* Glassmorphic Omni Panel */
-.omni-card {
-  background: rgba(15, 17, 23, 0.85) !important;
-  backdrop-filter: blur(16px) !important;
-  -webkit-backdrop-filter: blur(16px) !important;
-  border: 1px solid rgba(255, 255, 255, 0.12) !important;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6) !important;
-}
-
-.omni-card-hover {
-  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
-}
-
-.omni-card-hover:hover {
-  border-color: rgba(244, 63, 94, 0.5) !important;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.7), 0 0 25px rgba(244, 63, 94, 0.25) !important;
-  transform: translateY(-2px) !important;
-}
-
-/* Inputs styling */
-.omni-input {
-  background: #11131c !important;
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
-  color: #f3f4f6 !important;
-  transition: all 0.2s ease !important;
-}
-
-.omni-input:focus {
-  outline: none !important;
-  border-color: #f43f5e !important;
-  box-shadow: 0 0 15px rgba(244, 63, 94, 0.3) !important;
-}
-
-/* Smooth custom scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #090a0f;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1f2937;
-  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #374151;
+  background: rgba(255, 255, 255, 0.22);
 }

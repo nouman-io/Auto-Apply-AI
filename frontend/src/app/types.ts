@@ -47,68 +47,52 @@ export interface AppNotification {
   created_at: string;
 }
 
-export interface Experience {
-  title: string;
-  company: string;
-  description?: string;
-  duration?: string;
-  date?: string;
-}
-
-export interface Education {
-  degree: string;
-  institution: string;
-  year?: string;
-  date?: string;
-}
-
 export interface Project {
   name?: string;
   title?: string;
   description?: string;
   technologies?: string[];
-  url?: string;
 }
 
 export interface ProfileData {
+  full_name?: string;
+  phone?: string;
   summary: string;
   skills: string[];
-  experience: Experience[];
-  education: Education[];
+  experience: { title: string; company: string; duration?: string; description?: string }[];
+  education: { degree: string; institution: string; year?: string }[];
   projects: Project[];
-  languages?: string[];
+  ats_score?: number | null;
+  formatting_score?: number;
+  keyword_density_score?: number;
+  action_verbs_score?: number;
+  section_completeness_score?: number;
+  ats_suggestions?: {
+    missing_skills?: string[];
+    formatting_suggestions?: string[];
+    experience_improvements?: string[];
+  };
 }
 
-export interface AtsMetrics {
-  overall_score: number;
-  formatting_score: number;
-  keyword_density_score: number;
-  action_verbs_score: number;
-  section_completeness_score: number;
-  summary: string;
-  strengths: string[];
-  missing_skills: string[];
-  formatting_suggestions: string[];
-  experience_improvements: string[];
-}
-
-export interface UserSettings {
+export interface WorkspaceSettings {
   llm_provider: string;
   llm_model: string;
   custom_api_base: string;
   openai_api_key: string;
   google_client_id: string;
   google_client_secret: string;
+  is_gmail_connected: boolean;
+  gmail_email_address: string;
+  enabled_connectors: string[];
   greenhouse_companies: string[];
   serpapi_api_key: string;
   job_details: string;
   target_roles: string[];
   target_countries: string[];
   work_mode_preference: string;
-  employment_types: string[];
   salary_preference: string;
   experience_level: string;
-  visa_sponsorship: string;
+  visa_sponsorship_str: string;
   daily_apply_limit: number;
   email: string;
   full_name: string;
