@@ -23,6 +23,7 @@ class FormFillerService:
         candidate_info: dict,
         resume_path: str = None,
         cover_letter_content: str = None,
+        storage_state_path: str = None,
     ) -> dict:
         """
         Launch Playwright headless Chromium, open the web application form,
@@ -57,7 +58,10 @@ class FormFillerService:
                     headless=settings.PLAYWRIGHT_HEADLESS,
                     timeout=settings.PLAYWRIGHT_TIMEOUT,
                 )
-                context = await browser.new_context(viewport={"width": 1280, "height": 900})
+                ctx_kwargs = {"viewport": {"width": 1280, "height": 900}}
+                if storage_state_path and os.path.exists(storage_state_path):
+                    ctx_kwargs["storage_state"] = storage_state_path
+                context = await browser.new_context(**ctx_kwargs)
                 page = await context.new_page()
 
                 await page.goto(application_url, timeout=settings.PLAYWRIGHT_TIMEOUT, wait_until="domcontentloaded")

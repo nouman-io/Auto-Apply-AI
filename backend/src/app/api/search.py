@@ -37,13 +37,16 @@ async def trigger_search(
             explicit_query=payload.query,
             explicit_country=payload.country,
         )
+        source_names = ", ".join(result.get("source_status", {}).keys())
+        msg = (
+            f"Scanned {source_names}: {result['new_opportunities_found']} new jobs found, "
+            f"{result['total_scored']} jobs matched to your resume."
+            if source_names
+            else "No job connectors are enabled yet. Connect your sources in Plugins first."
+        )
         return {
             "status": "success",
-            "message": (
-                f"Scanned LinkedIn, Indeed, Google & Greenhouse: "
-                f"{result['new_opportunities_found']} new jobs found, "
-                f"{result['total_scored']} jobs matched to your resume."
-            ),
+            "message": msg,
             **result,
         }
     except HTTPException:

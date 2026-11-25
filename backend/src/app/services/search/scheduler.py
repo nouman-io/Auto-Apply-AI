@@ -2,6 +2,7 @@ import asyncio
 import logging
 from src.app.db.database import SessionLocal
 from src.app.core.config import settings
+from src.app.core.security import DEFAULT_WORKSPACE_USER_ID
 from src.app.services.search.aggregator import SearchAggregator
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ async def run_scheduler_loop():
             for query in ("Python Developer", "Full Stack Engineer", "AI Engineer"):
                 if _shutdown_event.is_set():
                     break
-                await aggregator.run_aggregation(db, query)
+                await aggregator.run_aggregation(db, query, user_id=DEFAULT_WORKSPACE_USER_ID)
                 await asyncio.sleep(2.0)
         except Exception as e:
             logger.error(f"Scheduled background search error (non-fatal): {e}")

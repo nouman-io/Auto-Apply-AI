@@ -1,10 +1,20 @@
 import html
 import logging
-import re
+import os
 import xml.etree.ElementTree as ET
-from typing import List, Dict
+from typing import List, Dict, Optional
+from urllib.parse import quote_plus
 import httpx
 from bs4 import BeautifulSoup
+
+try:
+    from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    async_playwright = None
+    HAS_PLAYWRIGHT = False
+
+from src.app.core.config import settings
 from src.app.services.search.base import BaseSearchProvider
 
 logger = logging.getLogger(__name__)
@@ -28,10 +38,115 @@ INDEED_HOSTS = {
 class IndeedProvider(BaseSearchProvider):
     source_name = "Indeed"
 
-    async def search(self, query: str, country: str = "us", limit: int = 10, **kwargs) -> List[Dict]:
-        """Fetch public job listings from Indeed RSS / public search without bypassing anti-bot gates."""
+    async def search(
+        self,
+        query: str,
+        country: str = "us",
+        limit: int = 10,
+        session_path: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict]:
+        """Fetch live job listings from Indeed using signed-in Playwright session or RSS fallback."""
         cc = (country or "us").lower()
         host = INDEED_HOSTS.get(cc, "www.indeed.com")
+
+        if session_path and os.path.exists(session_path) and HAS_PLAYWRIGHT:
+            auth_results = await self._search_authenticated(query, cc, host, limit, session_path)
+            if auth_results is not None:
+                return auth_results
+
+        return await self._search_rss(query, cc, host, limit)
+
+    async def _search_authenticated(
+        self, query: str, cc: str, host: str, limit: int, session_path: str
+    ) -> Optional[List[Dict]]:
+        search_url = f"https://{host}/jobs?q={quote_plus(query)}&fromage=7&sort=date"
+        results: List[Dict] = []
+        async with async_playwright() as p:
+            browser = None
+            try:
+                browser = await p.chromium.launch(
+                    headless=settings.PLAYWRIGHT_HEADLESS,
+                    timeout=settings.PLAYWRIGHT_TIMEOUT,
+                )
+                context = await browser.new_context(
+                    storage_state=session_path,
+                    viewport={"width": 1280, "height": 900},
+                )
+                page = await context.new_page()
+                await page.goto(search_url, timeout=settings.PLAYWRIGHT_TIMEOUT, wait_until="domcontentloaded")
+                await page.wait_for_timeout(2200)
+
+                body_text = (await page.inner_text("body") or "").lower()
+                if any(m in body_text for m in ("verify you are human", "cloudflare", "hcaptcha", "additional verification")):
+                    self.last_status = {
+                        "source": self.source_name,
+                        "status": "blocked",
+                        "count": 0,
+                        "detail": f"Indeed ({host}) presented human verification.",
+                    }
+                    return []
+
+                cards = page.locator("div.job_seen_beacon")
+                card_count = min(await cards.count(), limit)
+                for i in range(card_count):
+                    card = cards.nth(i)
+                    try:
+                        link = card.locator("a.jcs-JobTitle").first
+                        if await link.count() == 0:
+                            continue
+                        title = (await link.inner_text(timeout=1500) or "").strip()
+                        href = (await link.get_attribute("href") or "").strip()
+                        if not title or not href:
+                            continue
+                        full_url = f"https://{host}{href}" if href.startswith("/") else href
+
+                        comp_el = card.locator("[data-testid='company-name']").first
+                        company = (await comp_el.inner_text(timeout=1500) or "Indeed Employer").strip() if await comp_el.count() > 0 else "Indeed Employer"
+                        loc_el = card.locator("[data-testid='text-location']").first
+                        loc_text = (await loc_el.inner_text(timeout=1500) or cc.upper()).strip() if await loc_el.count() > 0 else cc.upper()
+
+                        await link.click(timeout=2000)
+                        await page.wait_for_timeout(700)
+                        desc_el = page.locator("#jobDescriptionText").first
+                        description = (
+                            (await desc_el.inner_text(timeout=2000) or "").strip()
+                            if await desc_el.count() > 0
+                            else title
+                        )
+
+                        results.append({
+                            "title": " ".join(title.split()),
+                            "company": " ".join(company.split()),
+                            "location": " ".join(loc_text.split()),
+                            "country": cc,
+                            "description": description or title,
+                            "url": full_url,
+                            "apply_url": full_url,
+                            "salary": None,
+                            "opportunity_type": "internship" if "intern" in title.lower() else "job",
+                            "source": self.source_name,
+                            "raw_data": {"indeed_host": host, "authenticated": True},
+                        })
+                    except Exception:
+                        continue
+
+                await context.storage_state(path=session_path)
+                self.last_status = {
+                    "source": self.source_name,
+                    "status": "ok",
+                    "count": len(results),
+                    "detail": f"Inspected {len(results)} postings using signed-in Indeed session.",
+                }
+                return results
+            except Exception as exc:
+                logger.warning(f"Authenticated Indeed Playwright search error: {exc}")
+                return None
+            finally:
+                if browser:
+                    await browser.close()
+
+    async def _search_rss(self, query: str, cc: str, host: str, limit: int) -> List[Dict]:
         rss_url = f"https://{host}/rss"
         params = {"q": query, "sort": "date"}
         headers = {
@@ -66,7 +181,6 @@ class IndeedProvider(BaseSearchProvider):
                         if not raw_title or not link:
                             continue
 
-                        # Indeed RSS titles often look like "Role - Company - Location"
                         parts = [p.strip() for p in raw_title.split(" - ")]
                         title = parts[0] if parts else raw_title
                         company = parts[1] if len(parts) > 1 else "Indeed Employer"
@@ -74,7 +188,6 @@ class IndeedProvider(BaseSearchProvider):
 
                         soup = BeautifulSoup(desc_html, "html.parser")
                         description = html.unescape(soup.get_text(" ", strip=True))
-                        opp_type = "internship" if "intern" in title.lower() else "job"
                         results.append({
                             "title": title,
                             "company": company,
@@ -84,7 +197,7 @@ class IndeedProvider(BaseSearchProvider):
                             "url": link,
                             "apply_url": link,
                             "salary": None,
-                            "opportunity_type": opp_type,
+                            "opportunity_type": "internship" if "intern" in title.lower() else "job",
                             "source": self.source_name,
                             "raw_data": {"indeed_host": host},
                         })

@@ -29,7 +29,7 @@ export default function AppShell({ title, subtitle, actions, toast, children }: 
   const router = useRouter();
   const [cmdOpen, setCmdOpen] = useState(false);
   const [quota, setQuota] = useState({ today_applied: 0, daily_max: DAILY_APPLY_MAX });
-  const [connectorsCount, setConnectorsCount] = useState(4);
+  const [connectorsCount, setConnectorsCount] = useState(0);
   const [gmailReady, setGmailReady] = useState(false);
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -55,7 +55,12 @@ export default function AppShell({ title, subtitle, actions, toast, children }: 
   useEffect(() => {
     loadShellState();
     const timer = setInterval(loadShellState, 6000);
-    return () => clearInterval(timer);
+    const onRefresh = () => loadShellState();
+    window.addEventListener("autoapply:refresh-shell", onRefresh);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("autoapply:refresh-shell", onRefresh);
+    };
   }, [loadShellState]);
 
   useEffect(() => {

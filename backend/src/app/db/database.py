@@ -77,6 +77,12 @@ def sync_sqlite_schema(db_engine):
                         alter_query = f"ALTER TABLE {table_name} ADD COLUMN {col.name} {sql_type}"
                         try:
                             conn.execute(text(alter_query))
+                            if table_name == "user_settings" and col.name == "is_linkedin_connected":
+                                conn.execute(
+                                    text("UPDATE user_settings SET is_linkedin_connected = 0, enabled_connectors = '[]'")
+                                )
+                            elif table_name == "user_settings" and col.name == "is_indeed_connected":
+                                conn.execute(text("UPDATE user_settings SET is_indeed_connected = 0"))
                             conn.commit()
                             logger.info(f"Auto-migrated SQLite column: {table_name}.{col.name}")
                         except Exception as ex:

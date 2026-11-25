@@ -253,12 +253,21 @@ async def execute_job_application(
     target_url = job.apply_url or job.url
     candidate_info = _build_candidate_info(user, profile, resume_path)
 
+    storage_state = None
+    lower_url = (target_url or "").lower()
+    if user_settings:
+        if "linkedin.com" in lower_url and user_settings.linkedin_session_path and os.path.exists(user_settings.linkedin_session_path):
+            storage_state = user_settings.linkedin_session_path
+        elif "indeed." in lower_url and user_settings.indeed_session_path and os.path.exists(user_settings.indeed_session_path):
+            storage_state = user_settings.indeed_session_path
+
     filler = FormFillerService()
     fill_res = await filler.auto_fill_application(
         application_url=target_url,
         candidate_info=candidate_info,
         resume_path=resume_path,
         cover_letter_content=cover_letter,
+        storage_state_path=storage_state,
     )
 
     success = bool(fill_res.get("success"))

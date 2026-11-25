@@ -21,6 +21,21 @@ interface PluginModalProps {
   notify: (msg: string, type?: "success" | "error") => void;
 }
 
+const ACCOUNT_COPY: Record<string, { emailPlaceholder: string; passwordPlaceholder: string; note: string; passwordRequired: boolean }> = {
+  linkedin: {
+    emailPlaceholder: "LinkedIn account email",
+    passwordPlaceholder: "LinkedIn password",
+    note: "Sign in with your LinkedIn email & password so AutoApply can open LinkedIn jobs inside an authenticated session.",
+    passwordRequired: true,
+  },
+  indeed: {
+    emailPlaceholder: "Indeed account email",
+    passwordPlaceholder: "Indeed password (optional if using browser sign-in)",
+    note: "Sign in to Indeed via credentials or open the Browser Sign-In window (supports SSO & one-time verification).",
+    passwordRequired: false,
+  },
+};
+
 function SecretInput({
   value,
   onChange,
@@ -59,6 +74,9 @@ function SecretInput({
 
 export default function PluginModal({ plugin, settings, onClose, onUpdated, notify }: PluginModalProps) {
   const [saving, setSaving] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [accountEmail, setAccountEmail] = useState("");
+  const [accountPassword, setAccountPassword] = useState("");
   const [boards, setBoards] = useState("");
   const [serpKey, setSerpKey] = useState("");
   const [llmProvider, setLlmProvider] = useState("openai");
@@ -73,6 +91,15 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
 
   useEffect(() => {
     if (!plugin) return;
+    setAuthError(null);
+    setAccountPassword("");
+    setAccountEmail(
+      plugin.id === "linkedin"
+        ? settings.linkedin_email || ""
+        : plugin.id === "indeed"
+          ? settings.indeed_email || ""
+          : ""
+    );
     setBoards((settings.greenhouse_companies || []).join(", "));
     setSerpKey(settings.serpapi_api_key || "");
     setLlmProvider(settings.llm_provider || "openai");
@@ -96,14 +123,21 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
 
   if (!plugin) return null;
 
-  const isSource = plugin.category === "Job Sources";
+  const isAccountConnector = plugin.id === "linkedin" || plugin.id === "indeed";
+  const isToggleSource = plugin.id === "google" || plugin.id === "greenhouse";
   const enabledList = settings.enabled_connectors || [];
   const isConnected =
     plugin.id === "gmail"
       ? settings.is_gmail_connected
       : plugin.id === "ai"
         ? Boolean(settings.openai_api_key || settings.llm_provider === "ollama")
-        : enabledList.includes(plugin.id);
+        : plugin.id === "linkedin"
+          ? Boolean(settings.is_linkedin_connected && enabledList.includes("linkedin"))
+          : plugin.id === "indeed"
+            ? Boolean(settings.is_indeed_connected && enabledList.includes("indeed"))
+            : enabledList.includes(plugin.id);
+
+  const syncShell = () => window.dispatchEvent(new Event("autoapply:refresh-shell"));
 
   const toggleSource = async () => {
     setSaving(true);
@@ -116,6 +150,7 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
         body: JSON.stringify({ enabled_connectors: next }),
       });
       await onUpdated();
+      syncShell();
       notify(`${plugin.name} ${isConnected ? "disconnected" : "connected"}.`);
     } catch (e: unknown) {
       notify(e instanceof Error ? e.message : "Failed to update connector", "error");
@@ -124,8 +159,59 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
     }
   };
 
+  const handleAccountSignIn = async (interactive: boolean) => {
+    setAuthError(null);
+    if (!interactive && !accountEmail.trim()) {
+      setAuthError(`Enter your ${plugin.name} email address first.`);
+      return;
+    }
+    if (!interactive && plugin.id === "linkedin" && !accountPassword) {
+      setAuthError("Enter your LinkedIn password before signing in.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiJson<{ message: string }>(`/api/v1/users/connectors/${plugin.id}/connect`, {
+        method: "POST",
+        body: JSON.stringify({
+          email: accountEmail.trim(),
+          password: accountPassword,
+          interactive,
+        }),
+      });
+      await onUpdated();
+      syncShell();
+      notify(res.message || `${plugin.name} signed in and connected.`);
+      onClose();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : `${plugin.name} sign-in failed`;
+      setAuthError(msg);
+      notify(msg, "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const disconnectAccountConnector = async () => {
+    setSaving(true);
+    try {
+      await apiJson(`/api/v1/users/connectors/${plugin.id}/disconnect`, { method: "POST" });
+      await onUpdated();
+      syncShell();
+      notify(`${plugin.name} disconnected.`);
+    } catch (err: unknown) {
+      notify(err instanceof Error ? err.message : "Disconnect failed", "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const saveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isAccountConnector && !isConnected) {
+      await handleAccountSignIn(false);
+      return;
+    }
     setSaving(true);
     try {
       if (plugin.id === "greenhouse") {
@@ -172,6 +258,7 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
         }
       }
       await onUpdated();
+      syncShell();
       notify(`${plugin.name} configuration saved.`);
       onClose();
     } catch (err: unknown) {
@@ -186,6 +273,7 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
     try {
       await apiJson("/api/v1/auth/gmail/disconnect", { method: "POST" });
       await onUpdated();
+      syncShell();
       notify("Gmail disconnected.");
     } catch (err: unknown) {
       notify(err instanceof Error ? err.message : "Disconnect failed", "error");
@@ -194,8 +282,9 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
     }
   };
 
-  const hasSaveableForm =
-    plugin.id === "greenhouse" || plugin.id === "google" || plugin.id === "ai" || plugin.id === "gmail";
+  const accountSpec = ACCOUNT_COPY[plugin.id];
+  const connectedAccountEmail =
+    plugin.id === "linkedin" ? settings.linkedin_email : settings.indeed_email;
 
   return (
     <div
@@ -206,7 +295,7 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
         onClick={(e) => e.stopPropagation()}
         className="panel-elevated rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden"
       >
-        {/* ChatGPT-style Connector Header */}
+        {/* ChatGPT / Claude-style Connector Header */}
         <div className="p-5 border-b border-white/[0.08] flex items-start justify-between gap-4">
           <div className="flex items-center gap-3.5">
             <div className="w-11 h-11 rounded-xl bg-white/[0.05] border border-white/10 flex items-center justify-center shrink-0">
@@ -241,11 +330,83 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
             {plugin.permissions}
           </div>
 
-          {isSource && (
+          {/* Account-Authenticated Connector UI (LinkedIn / Indeed) */}
+          {isAccountConnector && accountSpec && (
+            isConnected ? (
+              <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.05] p-4 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-white font-medium">Authenticated Browser Session Active</div>
+                  <div className="text-[11px] text-emerald-300 font-mono truncate mt-0.5">
+                    {connectedAccountEmail || `${plugin.name} account linked`}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={disconnectAccountConnector}
+                  className="px-3 py-1.5 rounded-lg border border-red-500/30 bg-red-500/10 text-red-300 hover:bg-red-500/20 font-medium shrink-0"
+                >
+                  {saving ? "..." : "Disconnect"}
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3 rounded-xl border border-white/10 bg-[#0d0f14] p-4">
+                <div className="text-[11px] text-zinc-300 leading-relaxed">{accountSpec.note}</div>
+
+                <div className="space-y-2.5">
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">Account Email</label>
+                    <input
+                      type="email"
+                      value={accountEmail}
+                      onChange={(e) => setAccountEmail(e.target.value)}
+                      placeholder={accountSpec.emailPlaceholder}
+                      className="w-full field rounded-lg px-3 py-2 text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-zinc-400 mb-1">Password</label>
+                    <SecretInput
+                      value={accountPassword}
+                      onChange={setAccountPassword}
+                      placeholder={accountSpec.passwordPlaceholder}
+                    />
+                  </div>
+                </div>
+
+                {authError && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200 leading-relaxed">
+                    {authError}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={saving}
+                    onClick={() => handleAccountSignIn(true)}
+                    className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/[0.04] hover:bg-white/[0.08] text-zinc-200 text-[11px] font-medium disabled:opacity-40"
+                  >
+                    Open Browser Sign-In
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="px-4 py-1.5 rounded-lg bg-white text-black font-semibold hover:bg-zinc-200 disabled:opacity-50"
+                  >
+                    {saving ? "Signing in..." : `Sign In & Connect`}
+                  </button>
+                </div>
+              </div>
+            )
+          )}
+
+          {/* Direct Toggle Job Sources (Google / Greenhouse) */}
+          {isToggleSource && (
             <div className="flex items-center justify-between rounded-xl border border-white/10 bg-[#0d0f14] px-4 py-3">
               <div>
                 <div className="font-medium text-white">Enable {plugin.name}</div>
-                <div className="text-[11px] text-zinc-500">Include {plugin.name} when running Find Jobs</div>
+                <div className="text-[11px] text-zinc-500">Disconnected by default — enable when ready</div>
               </div>
               <button
                 type="button"
@@ -406,7 +567,7 @@ export default function PluginModal({ plugin, settings, onClose, onUpdated, noti
               >
                 Close
               </button>
-              {hasSaveableForm && (
+              {(plugin.id === "greenhouse" || plugin.id === "google" || plugin.id === "ai" || plugin.id === "gmail") && (
                 <button
                   type="submit"
                   disabled={saving}

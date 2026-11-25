@@ -127,7 +127,9 @@ class SearchAggregator:
 
         greenhouse_companies = None
         serpapi_key = None
-        enabled = {"linkedin", "indeed", "google", "greenhouse"}
+        enabled = set()
+        linkedin_session = None
+        indeed_session = None
         if user_id and db:
             u_set = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
             if u_set:
@@ -136,15 +138,23 @@ class SearchAggregator:
                 serpapi_key = u_set.serpapi_api_key
                 if u_set.enabled_connectors is not None:
                     enabled = {c.lower() for c in u_set.enabled_connectors}
+                if not u_set.is_linkedin_connected:
+                    enabled.discard("linkedin")
+                else:
+                    linkedin_session = u_set.linkedin_session_path
+                if not u_set.is_indeed_connected:
+                    enabled.discard("indeed")
+                else:
+                    indeed_session = u_set.indeed_session_path
 
         providers = []
         tasks = []
         if "linkedin" in enabled:
             providers.append(self.linkedin)
-            tasks.append(self.linkedin.search(query, country=country))
+            tasks.append(self.linkedin.search(query, country=country, session_path=linkedin_session))
         if "indeed" in enabled:
             providers.append(self.indeed)
-            tasks.append(self.indeed.search(query, country=country))
+            tasks.append(self.indeed.search(query, country=country, session_path=indeed_session))
         if "google" in enabled:
             providers.append(self.google)
             tasks.append(self.google.search(query, country=country, serpapi_key=serpapi_key))

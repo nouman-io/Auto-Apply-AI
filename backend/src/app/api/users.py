@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, List, Union
 from sqlalchemy.orm import Session
@@ -7,8 +7,25 @@ from src.app.db.database import get_db
 from src.app.core.config import settings as app_settings
 from src.app.core.security import get_current_user
 from src.app.db.models import User, Profile, UserSettings
+from src.app.services.search.connector_auth import (
+    connect_linkedin,
+    connect_indeed,
+    disconnect_session,
+)
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+class LinkedInConnectRequest(BaseModel):
+    email: str
+    password: str = ""
+    interactive: bool = False
+
+
+class IndeedConnectRequest(BaseModel):
+    email: str = ""
+    password: str = ""
+    interactive: bool = False
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -78,6 +95,13 @@ def get_user_settings(current_user: User = Depends(get_current_user), db: Sessio
 
     profile = db.query(Profile).filter(Profile.user_id == uid).first()
 
+    raw_enabled = user_settings.enabled_connectors if user_settings.enabled_connectors is not None else []
+    enabled_list = [
+        str(c).lower() for c in raw_enabled
+        if (str(c).lower() != "linkedin" or user_settings.is_linkedin_connected)
+        and (str(c).lower() != "indeed" or user_settings.is_indeed_connected)
+    ]
+
     return {
         "llm_provider": user_settings.llm_provider or "openai",
         "llm_model": user_settings.llm_model or "gpt-4o-mini",
@@ -85,9 +109,13 @@ def get_user_settings(current_user: User = Depends(get_current_user), db: Sessio
         "openai_api_key": _mask_key(user_settings.openai_api_key),
         "google_client_id": user_settings.google_client_id or "",
         "google_client_secret": _mask_key(user_settings.google_client_secret),
-        "enabled_connectors": user_settings.enabled_connectors if user_settings.enabled_connectors is not None else ["linkedin", "indeed", "google", "greenhouse"],
+        "enabled_connectors": enabled_list,
         "greenhouse_companies": user_settings.greenhouse_companies or app_settings.TRACKED_COMPANIES_GREENHOUSE,
         "serpapi_api_key": _mask_key(user_settings.serpapi_api_key),
+        "is_linkedin_connected": bool(user_settings.is_linkedin_connected),
+        "linkedin_email": user_settings.linkedin_email or "",
+        "is_indeed_connected": bool(user_settings.is_indeed_connected),
+        "indeed_email": user_settings.indeed_email or "",
         "is_gmail_connected": user_settings.is_gmail_connected,
         "gmail_email_address": user_settings.gmail_email_address or "",
         "job_details": user_settings.job_details or "",
@@ -137,7 +165,18 @@ def update_user_settings(
         user_settings.google_client_secret = payload.google_client_secret
     if payload.enabled_connectors is not None:
         allowed = {"linkedin", "indeed", "google", "greenhouse"}
-        user_settings.enabled_connectors = [c.lower() for c in payload.enabled_connectors if c.lower() in allowed]
+        requested = [c.lower() for c in payload.enabled_connectors if c.lower() in allowed]
+        if "linkedin" in requested and not user_settings.is_linkedin_connected:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Sign in with your LinkedIn email & password before enabling LinkedIn.",
+            )
+        if "indeed" in requested and not user_settings.is_indeed_connected:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Sign in to Indeed before enabling the Indeed connector.",
+            )
+        user_settings.enabled_connectors = list(dict.fromkeys(requested))
     if payload.greenhouse_companies is not None:
         user_settings.greenhouse_companies = [c.strip().lower() for c in payload.greenhouse_companies if c.strip()]
     if payload.serpapi_api_key is not None and "••••••••" not in payload.serpapi_api_key:
@@ -147,6 +186,113 @@ def update_user_settings(
 
     db.commit()
     return {"status": "success", "message": "API keys and integration settings saved successfully!"}
+
+
+@router.post("/connectors/linkedin/connect")
+async def connect_linkedin_connector(
+    payload: LinkedInConnectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sign in to LinkedIn with email/password (or browser window) before enabling connector."""
+    if not payload.interactive and (not payload.email.strip() or not payload.password):
+        raise HTTPException(status_code=400, detail="LinkedIn email and password are required to connect.")
+
+    res = await connect_linkedin(
+        user_id=current_user.id,
+        email=payload.email.strip(),
+        password=payload.password,
+        interactive=payload.interactive,
+    )
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error", "LinkedIn sign-in failed."))
+
+    u_set = db.query(UserSettings).filter(UserSettings.user_id == current_user.id).first()
+    if not u_set:
+        u_set = UserSettings(user_id=current_user.id)
+        db.add(u_set)
+
+    u_set.is_linkedin_connected = True
+    if payload.email.strip():
+        u_set.linkedin_email = payload.email.strip()
+    if payload.password:
+        u_set.linkedin_password = payload.password
+    u_set.linkedin_session_path = res.get("session_path")
+    current_enabled = list(u_set.enabled_connectors or [])
+    if "linkedin" not in current_enabled:
+        current_enabled.append("linkedin")
+    u_set.enabled_connectors = current_enabled
+    db.commit()
+
+    return {"status": "connected", "message": res.get("message", "LinkedIn connected.")}
+
+
+@router.post("/connectors/indeed/connect")
+async def connect_indeed_connector(
+    payload: IndeedConnectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Sign in to Indeed via credentials or browser window before enabling connector."""
+    if not payload.interactive and not payload.email.strip():
+        raise HTTPException(status_code=400, detail="Indeed email is required (or use Browser Sign-In).")
+
+    res = await connect_indeed(
+        user_id=current_user.id,
+        email=payload.email.strip(),
+        password=payload.password,
+        interactive=payload.interactive,
+    )
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Indeed sign-in failed."))
+
+    u_set = db.query(UserSettings).filter(UserSettings.user_id == current_user.id).first()
+    if not u_set:
+        u_set = UserSettings(user_id=current_user.id)
+        db.add(u_set)
+
+    u_set.is_indeed_connected = True
+    if payload.email.strip():
+        u_set.indeed_email = payload.email.strip()
+    if payload.password:
+        u_set.indeed_password = payload.password
+    u_set.indeed_session_path = res.get("session_path")
+    current_enabled = list(u_set.enabled_connectors or [])
+    if "indeed" not in current_enabled:
+        current_enabled.append("indeed")
+    u_set.enabled_connectors = current_enabled
+    db.commit()
+
+    return {"status": "connected", "message": res.get("message", "Indeed connected.")}
+
+
+@router.post("/connectors/{provider}/disconnect")
+def disconnect_job_connector(
+    provider: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disconnect a job connector and wipe stored credentials/session if applicable."""
+    prov = provider.strip().lower()
+    if prov not in {"linkedin", "indeed", "google", "greenhouse"}:
+        raise HTTPException(status_code=404, detail="Unknown connector provider.")
+
+    u_set = db.query(UserSettings).filter(UserSettings.user_id == current_user.id).first()
+    if u_set:
+        if prov == "linkedin":
+            disconnect_session(u_set.linkedin_session_path)
+            u_set.is_linkedin_connected = False
+            u_set.linkedin_password = None
+            u_set.linkedin_session_path = None
+        elif prov == "indeed":
+            disconnect_session(u_set.indeed_session_path)
+            u_set.is_indeed_connected = False
+            u_set.indeed_password = None
+            u_set.indeed_session_path = None
+        u_set.enabled_connectors = [c for c in (u_set.enabled_connectors or []) if c.lower() != prov]
+        db.commit()
+
+    return {"status": "disconnected", "message": f"{prov.capitalize()} disconnected."}
 
 
 @router.put("/profile")

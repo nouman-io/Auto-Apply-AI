@@ -13,15 +13,15 @@ const PLUGINS: PluginDef[] = [
     id: "linkedin",
     name: "LinkedIn",
     category: "Job Sources",
-    description: "Fetch real-time openings and external apply links from LinkedIn Jobs.",
-    permissions: "Read public job postings & apply URLs",
+    description: "Sign in with your LinkedIn account to inspect live roles inside a verified browser session.",
+    permissions: "Account session login, read job listings & apply URLs",
   },
   {
     id: "indeed",
     name: "Indeed",
     category: "Job Sources",
-    description: "Discover matching regional and remote roles from Indeed listings.",
-    permissions: "Read public job feeds & descriptions",
+    description: "Sign in to Indeed so full postings and employer links load inside an authenticated session.",
+    permissions: "Account sign-in, read job feeds & descriptions",
   },
   {
     id: "google",
@@ -62,7 +62,11 @@ const EMPTY_SETTINGS: WorkspaceSettings = {
   google_client_secret: "",
   is_gmail_connected: false,
   gmail_email_address: "",
-  enabled_connectors: ["linkedin", "indeed", "google", "greenhouse"],
+  is_linkedin_connected: false,
+  linkedin_email: "",
+  is_indeed_connected: false,
+  indeed_email: "",
+  enabled_connectors: [],
   greenhouse_companies: [],
   serpapi_api_key: "",
   job_details: "",
@@ -99,7 +103,7 @@ export default function PluginsPage() {
       const data = await apiJson<WorkspaceSettings>("/api/v1/users/settings");
       setSettings(data);
     } catch {
-      // fallback to defaults when backend is unavailable
+      // fallback keeps connectors disconnected
     }
   }, []);
 
@@ -138,27 +142,51 @@ export default function PluginsPage() {
   }, [loadSettings, notify]);
 
   const isPluginConnected = (id: string) => {
+    const enabled = settings.enabled_connectors || [];
     if (id === "gmail") return settings.is_gmail_connected;
     if (id === "ai") return Boolean(settings.openai_api_key || settings.llm_provider === "ollama");
-    return (settings.enabled_connectors || []).includes(id);
+    if (id === "linkedin") return Boolean(settings.is_linkedin_connected && enabled.includes("linkedin"));
+    if (id === "indeed") return Boolean(settings.is_indeed_connected && enabled.includes("indeed"));
+    return enabled.includes(id);
   };
 
-  const quickToggleSource = async (e: React.MouseEvent, plugin: PluginDef) => {
+  const handleCardAction = async (e: React.MouseEvent, plugin: PluginDef) => {
     e.stopPropagation();
-    if (plugin.category !== "Job Sources" || togglingId) return;
+    if (togglingId) return;
+
+    const connected = isPluginConnected(plugin.id);
+
+    // LinkedIn & Indeed require explicit sign-in modal before connecting
+    if ((plugin.id === "linkedin" || plugin.id === "indeed") && !connected) {
+      setActivePlugin(plugin);
+      return;
+    }
+
+    if (plugin.category !== "Job Sources") {
+      setActivePlugin(plugin);
+      return;
+    }
+
     setTogglingId(plugin.id);
-    const current = settings.enabled_connectors || [];
-    const connected = current.includes(plugin.id);
-    const next = connected ? current.filter((x) => x !== plugin.id) : Array.from(new Set([...current, plugin.id]));
     try {
-      await apiJson("/api/v1/users/settings", {
-        method: "PUT",
-        body: JSON.stringify({ enabled_connectors: next }),
-      });
-      setSettings((prev) => ({ ...prev, enabled_connectors: next }));
-      notify(`${plugin.name} ${connected ? "disabled" : "enabled"}.`);
+      if ((plugin.id === "linkedin" || plugin.id === "indeed") && connected) {
+        await apiJson(`/api/v1/users/connectors/${plugin.id}/disconnect`, { method: "POST" });
+        await loadSettings();
+        window.dispatchEvent(new Event("autoapply:refresh-shell"));
+        notify(`${plugin.name} disconnected.`);
+      } else {
+        const current = settings.enabled_connectors || [];
+        const next = connected ? current.filter((x) => x !== plugin.id) : Array.from(new Set([...current, plugin.id]));
+        await apiJson("/api/v1/users/settings", {
+          method: "PUT",
+          body: JSON.stringify({ enabled_connectors: next }),
+        });
+        setSettings((prev) => ({ ...prev, enabled_connectors: next }));
+        window.dispatchEvent(new Event("autoapply:refresh-shell"));
+        notify(`${plugin.name} ${connected ? "disconnected" : "connected"}.`);
+      }
     } catch (err: unknown) {
-      notify(err instanceof Error ? err.message : "Failed to toggle connector", "error");
+      notify(err instanceof Error ? err.message : "Failed to update connector", "error");
     } finally {
       setTogglingId(null);
     }
@@ -174,10 +202,29 @@ export default function PluginsPage() {
     return p.name.toLowerCase().includes(q) || p.description.toLowerCase().includes(q);
   });
 
+  const getCardStatusText = (plugin: PluginDef, connected: boolean) => {
+    if (plugin.id === "linkedin") {
+      return connected ? settings.linkedin_email || "Session active" : "Sign in with email & password";
+    }
+    if (plugin.id === "indeed") {
+      return connected ? settings.indeed_email || "Session active" : "Sign in to connect";
+    }
+    if (plugin.id === "gmail") {
+      return settings.gmail_email_address || "Not connected";
+    }
+    if (plugin.id === "ai") {
+      return connected ? `${settings.llm_provider} · ${settings.llm_model}` : "Configure API key";
+    }
+    if (plugin.id === "greenhouse") {
+      return connected ? `${settings.greenhouse_companies?.length || 0} tracked boards` : "Disconnected by default";
+    }
+    return connected ? "Enabled for search" : "Disconnected by default";
+  };
+
   return (
     <AppShell
       title="Plugins & Connectors"
-      subtitle="Connect job boards, email delivery, and AI providers in one directory"
+      subtitle="All connectors start disconnected — sign in or enable only the sources you want"
       toast={toast}
       actions={
         <div className="flex items-center gap-3 text-xs">
@@ -194,7 +241,6 @@ export default function PluginsPage() {
       }
     >
       <div className="space-y-5">
-        {/* Directory Search & Filter Header */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-1 p-1 rounded-lg bg-[#12141b] border border-white/[0.08] w-fit">
             {(["All", "Job Sources", "Delivery & AI", "Connected"] as const).map((t) => (
@@ -224,19 +270,10 @@ export default function PluginsPage() {
           </div>
         </div>
 
-        {/* ChatGPT-Style Plugin Directory Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((plugin) => {
             const connected = isPluginConnected(plugin.id);
-            const isSource = plugin.category === "Job Sources";
-            const statusText =
-              plugin.id === "gmail" && settings.gmail_email_address
-                ? settings.gmail_email_address
-                : plugin.id === "ai"
-                  ? `${settings.llm_provider} · ${settings.llm_model}`
-                  : plugin.id === "greenhouse"
-                    ? `${settings.greenhouse_companies?.length || 0} custom boards`
-                    : "Official connector";
+            const isAccount = plugin.id === "linkedin" || plugin.id === "indeed";
 
             return (
               <div
@@ -256,40 +293,32 @@ export default function PluginsPage() {
                       </div>
                     </div>
 
-                    {isSource ? (
-                      <button
-                        type="button"
-                        onClick={(e) => quickToggleSource(e, plugin)}
-                        disabled={togglingId === plugin.id}
-                        aria-label={`Toggle ${plugin.name}`}
-                        className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full border transition-colors shrink-0 ${
-                          connected
-                            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25 hover:bg-emerald-500/20"
-                            : "bg-white/[0.03] text-zinc-400 border-white/10 hover:text-white"
-                        }`}
-                      >
-                        <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-zinc-500"}`} />
-                        {togglingId === plugin.id ? "..." : connected ? "Enabled" : "Enable"}
-                      </button>
-                    ) : (
-                      <span
-                        className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full border shrink-0 ${
-                          connected
-                            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
-                            : "bg-white/[0.03] text-zinc-400 border-white/10"
-                        }`}
-                      >
-                        <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-zinc-500"}`} />
-                        {connected ? "Connected" : "Setup"}
-                      </span>
-                    )}
+                    <button
+                      type="button"
+                      onClick={(e) => handleCardAction(e, plugin)}
+                      disabled={togglingId === plugin.id}
+                      className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full border transition-colors shrink-0 ${
+                        connected
+                          ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25 hover:bg-emerald-500/20"
+                          : "bg-white/[0.04] text-zinc-200 border-white/15 hover:bg-white hover:text-black"
+                      }`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-zinc-500"}`} />
+                      {togglingId === plugin.id
+                        ? "..."
+                        : connected
+                          ? "Connected"
+                          : isAccount
+                            ? "Sign In"
+                            : "Connect"}
+                    </button>
                   </div>
 
                   <p className="text-xs text-zinc-400 leading-relaxed">{plugin.description}</p>
                 </div>
 
                 <div className="pt-3 border-t border-white/[0.06] flex items-center justify-between text-xs gap-2">
-                  <span className="text-zinc-500 text-[11px] truncate">{statusText}</span>
+                  <span className="text-zinc-500 text-[11px] truncate">{getCardStatusText(plugin, connected)}</span>
                   <span className="text-zinc-200 font-medium shrink-0">Configure →</span>
                 </div>
               </div>

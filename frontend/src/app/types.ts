@@ -83,6 +83,10 @@ export interface WorkspaceSettings {
   google_client_secret: string;
   is_gmail_connected: boolean;
   gmail_email_address: string;
+  is_linkedin_connected?: boolean;
+  linkedin_email?: string;
+  is_indeed_connected?: boolean;
+  indeed_email?: string;
   enabled_connectors: string[];
   greenhouse_companies: string[];
   serpapi_api_key: string;

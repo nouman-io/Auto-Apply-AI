@@ -72,10 +72,20 @@ class UserSettings(Base):
     custom_api_base = Column(String, nullable=True)
     openai_api_key = Column(String, nullable=True)
 
-    # Search Connectors Configuration
-    enabled_connectors = Column(JSON, default=lambda: ["linkedin", "indeed", "google", "greenhouse"])
+    # Search Connectors Configuration (disconnected by default; user connects intentionally)
+    enabled_connectors = Column(JSON, default=list)
     greenhouse_companies = Column(JSON, default=list)
     serpapi_api_key = Column(String, nullable=True)
+
+    # LinkedIn & Indeed Authenticated Connector Sessions
+    is_linkedin_connected = Column(Boolean, default=False)
+    linkedin_email = Column(String, nullable=True)
+    linkedin_password = Column(String, nullable=True)
+    linkedin_session_path = Column(String, nullable=True)
+    is_indeed_connected = Column(Boolean, default=False)
+    indeed_email = Column(String, nullable=True)
+    indeed_password = Column(String, nullable=True)
+    indeed_session_path = Column(String, nullable=True)
 
     # Gmail OAuth & Email Connection Settings
     google_client_id = Column(String, nullable=True)
